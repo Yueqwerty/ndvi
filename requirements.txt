@@ -1,0 +1,18 @@
+# requirements.txt
+
+# Existing dependencies
+aiohttp
+numpy
+pandas
+rasterio
+shapely
+pyproj
+loguru
+dash
+plotly
+python-dotenv
+
+# Sphinx and extensions
+sphinx
+sphinx-autodoc-typehints
+sphinx-rtd-theme
