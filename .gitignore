@@ -10,26 +10,20 @@ env/
 env.bak/
 venv.bak/
 
-# Archivos de configuración
 *.env
 .env.*
 
-# Archivos de logs
 logs/
 *.log
 
-# Directorios de construcción
 build/
 dist/
 *.egg-info/
 
-# Archivos de Sphinx
 docs/_build/
 
-# Archivos de Jupyter Notebook
 .ipynb_checkpoints
 
-# Otros archivos y directorios
 *.DS_Store
 *.sqlite3
 EOL
