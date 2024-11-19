@@ -50,8 +50,8 @@ logger.add(LOG_FILE, rotation="1 MB", retention="7 days", level=LOG_LEVEL)
 logger.add(sys.stdout, level=LOG_LEVEL)  # Add console logging
 
 # Sentinel Hub Configuration
-CLIENT_ID = os.getenv("SENTINELHUB_CLIENT_ID")
-CLIENT_SECRET = os.getenv("SENTINELHUB_CLIENT_SECRET")
+CLIENT_ID = "c1326a3f-464d-4e4b-897a-4ca6281ffc2d"
+CLIENT_SECRET = "NNZzqTVR5DWQraGNCFTR5O0AHLypxKQg"
 TOKEN_URL = os.getenv("SENTINELHUB_TOKEN_URL", "https://services.sentinel-hub.com/oauth/token")
 PROCESS_URL = os.getenv("SENTINELHUB_PROCESS_URL", "https://services-uswest2.sentinel-hub.com/api/v1/process")
 

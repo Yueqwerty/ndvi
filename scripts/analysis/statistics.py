@@ -1,34 +1,32 @@
+# scripts/analysis/statistics.py
+
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 from loguru import logger
 
 def load_statistics(month: str, sub_area: int, data_dir: Path) -> Dict[str, float]:
     """
-    Carga las estadísticas de NDVI para un mes y una sub-área específica.
-    
-    Parameters
-    ----------
-    month : str
-        Mes en formato 'YYYY-MM'.
-    sub_area : int
-        Número de sub-área.
-    data_dir : Path
-        Ruta al directorio de datos.
-    
-    Returns
-    -------
-    Dict[str, float]
-        Diccionario con estadísticas de NDVI.
+    Load NDVI statistics for a specific month and sub-area.
+
+    :param month: Month in 'YYYY-MM' format.
+    :type month: str
+    :param sub_area: Sub-area number.
+    :type sub_area: int
+    :param data_dir: Path to the data directory.
+    :type data_dir: Path
+    :return: Dictionary containing NDVI statistics.
+    :rtype: Dict[str, float]
+    :raises FileNotFoundError: If the statistics file does not exist.
     """
     stats_path = data_dir.parent / "results" / "statistics"
     stats_file = stats_path / f"ndvi_statistics_{month}_sub_area_{sub_area}.json"
     
     if not stats_file.exists():
-        logger.error(f"Archivo de estadísticas no encontrado: {stats_file}")
-        raise FileNotFoundError(f"Archivo de estadísticas no encontrado: {stats_file}")
+        logger.error(f"Statistics file not found: {stats_file}")
+        raise FileNotFoundError(f"Statistics file not found: {stats_file}")
     
     with open(stats_file, 'r') as f:
         stats = json.load(f)
@@ -36,21 +34,16 @@ def load_statistics(month: str, sub_area: int, data_dir: Path) -> Dict[str, floa
 
 def load_all_statistics(months: List[str], sub_area: int, data_dir: Path) -> List[Dict[str, float]]:
     """
-    Carga las estadísticas de NDVI para múltiples meses y una sub-área específica.
-    
-    Parameters
-    ----------
-    months : List[str]
-        Lista de meses en formato 'YYYY-MM'.
-    sub_area : int
-        Número de sub-área.
-    data_dir : Path
-        Ruta al directorio de datos.
-    
-    Returns
-    -------
-    List[Dict[str, float]]
-        Lista de diccionarios con estadísticas de NDVI por mes.
+    Load NDVI statistics for multiple months and a specific sub-area.
+
+    :param months: List of months in 'YYYY-MM' format.
+    :type months: List[str]
+    :param sub_area: Sub-area number.
+    :type sub_area: int
+    :param data_dir: Path to the data directory.
+    :type data_dir: Path
+    :return: List of dictionaries containing NDVI statistics per month.
+    :rtype: List[Dict[str, float]]
     """
     stats_list = []
     for month in months:
@@ -65,21 +58,17 @@ def load_all_statistics(months: List[str], sub_area: int, data_dir: Path) -> Lis
 
 def compute_trends(stats_list: List[Dict[str, float]]) -> Dict[str, float]:
     """
-    Calcula las tendencias de NDVI a partir de una lista de estadísticas.
-    
-    Parameters
-    ----------
-    stats_list : List[Dict[str, float]]
-        Lista de diccionarios con estadísticas de NDVI por mes.
-    
-    Returns
-    -------
-    Dict[str, float]
-        Diccionario con tendencias calculadas.
+    Compute NDVI trends from a list of statistics.
+
+    :param stats_list: List of dictionaries containing NDVI statistics per month.
+    :type stats_list: List[Dict[str, float]]
+    :return: Dictionary containing computed trends.
+    :rtype: Dict[str, float]
+    :raises ValueError: If the statistics list is empty.
     """
     if not stats_list:
-        logger.error("La lista de estadísticas está vacía.")
-        raise ValueError("La lista de estadísticas está vacía.")
+        logger.error("Statistics list is empty.")
+        raise ValueError("Statistics list is empty.")
     
     df = np.array([[
         stat['mean_ndvi'], 
