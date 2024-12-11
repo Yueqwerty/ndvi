@@ -51,15 +51,60 @@ def load_statistics(period_dir: Path) -> Dict[int, Dict]:
         logger.error(f"Unexpected error loading statistics: {e}")
         return {}
 
-def load_ndvi_array(file_path: Path) -> Optional[np.ndarray]:
+def load_ndvi_array(file_path: Path) -> np.ndarray:
     """
     Load NDVI array from a .npy file with robust error handling.
+
+    Parameters
+    ----------
+    file_path : Path
+        Path to the .npy file.
+
+    Returns
+    -------
+    np.ndarray
+        Loaded NDVI array.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
     """
     try:
+        logger.info(f"Loading NDVI data from: {file_path}")
         return np.load(file_path)
-    except (FileNotFoundError, PermissionError) as e:
-        logger.error(f"Error loading NDVI array from {file_path}: {e}")
-        return None
+    except FileNotFoundError:
+        logger.error(f"File not found: {file_path}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error loading file {file_path}: {e}")
+        raise
+
+def main():
+    # Base directories
+    data_dir = Path("data/processed/ndvi/")
+    period1 = "2019-03"
+    period2 = "2023-03"
+
+    # Directories for each period
+    period1_dir = data_dir / period1
+    period2_dir = data_dir / period2
+
+    for sub_area in range(1, 15):  # Assuming sub-areas are numbered 1 to 14
+        array1_path = period1_dir / f"sub_area_{sub_area}" / "ndvi_monthly.npy"
+        array2_path = period2_dir / f"sub_area_{sub_area}" / "ndvi_monthly.npy"
+
+        try:
+            # Load arrays
+            array1 = load_ndvi_array(array1_path)
+            array2 = load_ndvi_array(array2_path)
+
+            # Compare arrays (you can replace this with your comparison logic)
+            diff = array2 - array1
+            logger.info(f"NDVI difference calculated for sub-area {sub_area}")
+        except FileNotFoundError:
+            logger.warning(f"Skipping sub-area {sub_area} due to missing data.")
+            continue
 
 def compare_ndvi_arrays(array1: np.ndarray, array2: np.ndarray) -> np.ndarray:
     """
