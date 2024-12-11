@@ -86,6 +86,26 @@ SEASONS = {
     "winter": [6, 7, 8],     # June, July, August
 }
 
+def transform_bounds(bounds_wgs84: List[float], transformer: Transformer) -> List[float]:
+    """
+    Transform bounds from one CRS to another.
+
+    Parameters
+    ----------
+    bounds_wgs84 : List[float]
+        [minx, miny, maxx, maxy] in WGS84.
+    transformer : Transformer
+        pyproj Transformer object for CRS transformation.
+
+    Returns
+    -------
+    List[float]
+        Transformed [minx, miny, maxx, maxy].
+    """
+    minx, miny = transformer.transform(bounds_wgs84[0], bounds_wgs84[1])
+    maxx, maxy = transformer.transform(bounds_wgs84[2], bounds_wgs84[3])
+    return [minx, miny, maxx, maxy]
+
 async def obtain_token(session: aiohttp.ClientSession) -> Optional[str]:
     """
     Obtain Sentinel Hub access token.
@@ -421,17 +441,20 @@ async def process_sub_area(
     except IOError as io_err:
         logger.error(f"Error saving aggregated NDVI for Sub-area {sub_area_number}: {io_err}")
 
-    # Optionally: Save aggregated NDVI as GeoTIFF
-    sub_area_bounds = sub_area.get('bounds')
-    if sub_area_bounds:
+    # Save aggregated NDVI as GeoTIFF
+    sub_area_bounds_wgs84 = sub_area.get('bounds_wgs84')  # Ensure bounds are in WGS84
+    if sub_area_bounds_wgs84:
+        # Transform bounds to projected CRS (EPSG:32719)
+        bounds_proj = transform_bounds(sub_area_bounds_wgs84, transformer_to_proj)
+
         geotiff_path = raw_ndvi_path / f"sub_area_{sub_area_number}" / "ndvi_seasonal.tif"
         try:
-            save_ndvi_as_geotiff(aggregated_ndvi, geotiff_path, sub_area_bounds)
+            save_ndvi_as_geotiff(aggregated_ndvi, geotiff_path, bounds_proj, crs_epsg=32719)
             logger.info(f"Aggregated seasonal NDVI GeoTIFF saved to {geotiff_path}")
         except Exception as e:
             logger.error(f"Error saving aggregated seasonal NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
     else:
-        logger.warning(f"Bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")
+        logger.warning(f"WGS84 bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")
 
 async def process_sub_area_with_semaphore(semaphore, session, sub_area, dates, evalscript, token, raw_ndvi_path):
     """
@@ -487,13 +510,19 @@ async def main_async(
     for idx, poly in enumerate(sub_polygons):
         width_pixels, height_pixels = calculate_output_dimensions(poly)
         coords_wgs84 = [transformer_to_wgs84.transform(x, y) for x, y in poly.exterior.coords]
+        # Extract bounds in WGS84
+        min_lon = min(coords_wgs84, key=lambda x: x[0])[0]
+        min_lat = min(coords_wgs84, key=lambda x: x[1])[1]
+        max_lon = max(coords_wgs84, key=lambda x: x[0])[0]
+        max_lat = max(coords_wgs84, key=lambda x: x[1])[1]
         sub_areas_list.append({
             "number": idx + 1,
             "coords": coords_wgs84,
             "polygon": poly,
             "width_pixels": width_pixels,
             "height_pixels": height_pixels,
-            "bounds": poly.bounds  # (minx, miny, maxx, maxy) in projected CRS
+            "bounds": poly.bounds,  # (minx, miny, maxx, maxy) in projected CRS
+            "bounds_wgs84": [min_lon, min_lat, max_lon, max_lat]  # Added WGS84 bounds
         })
 
     # Filter sub-areas if specified
@@ -505,17 +534,18 @@ async def main_async(
     sub_area_bounds = {}
     for sub_area_dict in sub_areas_list:
         sub_area_number = sub_area_dict['number']
-        bounds = sub_area_dict['bounds']
-        # Convert projected bounds to WGS84
-        min_lon, min_lat = transformer_to_wgs84.transform(bounds[0], bounds[1])
-        max_lon, max_lat = transformer_to_wgs84.transform(bounds[2], bounds[3])
-        sub_area_bounds[str(sub_area_number)] = [min_lon, min_lat, max_lon, max_lat]
+        bounds_proj = sub_area_dict['bounds']
+        bounds_wgs84 = sub_area_dict['bounds_wgs84']
+        sub_area_bounds[str(sub_area_number)] = {
+            "bounds_proj": list(bounds_proj),
+            "bounds_wgs84": list(bounds_wgs84)
+        }
 
     # Save bounds to a JSON file
     bounds_file = data_dir / 'sub_area_bounds.json'
     bounds_file.parent.mkdir(parents=True, exist_ok=True)
     with open(bounds_file, 'w') as f:
-        json.dump(sub_area_bounds, f)
+        json.dump(sub_area_bounds, f, indent=4)
     logger.info(f"Sub-area bounds saved to {bounds_file}")
 
     # Get all months in the specified season
@@ -637,11 +667,11 @@ async def main_async(
             logger.error(f"Error saving aggregated seasonal NDVI for Sub-area {sub_area_number}: {io_err}")
 
         # Optionally, save aggregated NDVI as GeoTIFF
-        bounds = sub_area_dict['bounds']
-        if bounds:
+        bounds_proj = sub_area_dict['bounds']  # (minx, miny, maxx, maxy) in projected CRS
+        if bounds_proj:
             geotiff_path = output_dir / f"ndvi_{season}_{year}_sub_area_{sub_area_number}.tif"
             try:
-                save_ndvi_as_geotiff(aggregated_seasonal_ndvi, geotiff_path, bounds)
+                save_ndvi_as_geotiff(aggregated_seasonal_ndvi, geotiff_path, bounds_proj, crs_epsg=32719)
                 logger.info(f"Aggregated seasonal NDVI GeoTIFF saved to {geotiff_path}")
             except Exception as e:
                 logger.error(f"Error saving aggregated seasonal NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
@@ -667,8 +697,12 @@ async def main_async(
             else:
                 logger.error(f"Original aggregated NDVI file not found: {original_npy}")
             if original_tif.exists():
+                # Retrieve the bounds_proj from sub_area_bounds.json
+                with open(data_dir / 'sub_area_bounds.json', 'r') as f:
+                    bounds_data = json.load(f)
+                bounds_proj = bounds_data[str(best_sub_area)]['bounds_proj']
                 geotiff_data = rasterio.open(original_tif).read(1)
-                save_ndvi_as_geotiff(geotiff_data, best_ndvi_tif_path, sub_areas_list[best_sub_area - 1]['bounds'])
+                save_ndvi_as_geotiff(geotiff_data, best_ndvi_tif_path, bounds_proj, crs_epsg=32719)
                 logger.info(f"Best aggregated seasonal NDVI GeoTIFF saved to {best_ndvi_tif_path}")
             else:
                 logger.error(f"Original aggregated NDVI GeoTIFF file not found: {original_tif}")
