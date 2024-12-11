@@ -1,19 +1,19 @@
 import numpy as np
-from typing import List, Dict
+from typing import List
 
 def calculate_trend(values: List[float]) -> float:
     """
-    Calcula la pendiente de la línea de tendencia utilizando regresión lineal.
-    
+    Calculate the trend (slope) of a given list of values using linear regression.
+
     Parameters
     ----------
     values : List[float]
-        Lista de valores numéricos.
-    
+        List of numerical values.
+
     Returns
     -------
     float
-        Pendiente de la línea de tendencia.
+        The slope of the trend line.
     """
     x = np.arange(len(values))
     y = np.array(values)

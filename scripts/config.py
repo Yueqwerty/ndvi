@@ -1,10 +1,18 @@
 # scripts/config.py
 
-from typing import Dict, List
+from typing import Dict
 
-SEASONS: Dict[str, List[int]] = {
-    "spring": [9, 10, 11],   # September, October, November
-    "summer": [12, 1, 2],    # December, January, February
-    "autumn": [3, 4, 5],     # March, April, May
-    "winter": [6, 7, 8],     # June, July, August
+MONTHS: Dict[str, int] = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12
 }

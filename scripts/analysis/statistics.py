@@ -1,23 +1,18 @@
-# scripts/analysis/statistics.py
-
 import json
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
+
 import numpy as np
 from loguru import logger
-import pandas as pd
-from scipy import stats
 
-def load_all_statistics(years: List[int], season: str, sub_area: int, data_dir: Path) -> List[Dict]:
+def load_statistics(month: str, sub_area: int, data_dir: Path) -> Dict[str, float]:
     """
-    Load all statistical metrics for specified years, season, and sub-area.
+    Load NDVI statistics for a specific month and sub-area.
 
     Parameters
     ----------
-    years : List[int]
-        List of years.
-    season : str
-        Season name.
+    month : str
+        Month in 'YYYY-MM' format.
     sub_area : int
         Sub-area number.
     data_dir : Path
@@ -25,53 +20,100 @@ def load_all_statistics(years: List[int], season: str, sub_area: int, data_dir: 
 
     Returns
     -------
-    List[Dict]
-        List of statistics dictionaries.
-    """
-    stats_list = []
-    for year in years:
-        stats_path = data_dir / "statistics" / f"ndvi_statistics_{season}_{year}_sub_area_{sub_area}.json"
-        if stats_path.exists():
-            with open(stats_path, 'r') as f:
-                stats = json.load(f)
-                stats['year'] = year
-                stats_list.append(stats)
-                logger.debug(f"Loaded statistics from {stats_path}")
-        else:
-            logger.warning(f"Statistics file not found: {stats_path}")
-    return stats_list
+    Dict[str, float]
+        Dictionary containing NDVI statistics.
 
-def compute_trends(stats_list: List[Dict]) -> Dict[str, float]:
+    Raises
+    ------
+    FileNotFoundError
+        If the statistics file does not exist.
     """
-    Compute trends for each statistical metric over the years.
+    stats_path = data_dir.parent / "results" / "statistics"
+    stats_file = stats_path / f"ndvi_statistics_{month}_sub_area_{sub_area}.json"
+    
+    if not stats_file.exists():
+        logger.error(f"Statistics file not found: {stats_file}")
+        raise FileNotFoundError(f"Statistics file not found: {stats_file}")
+    
+    with open(stats_file, 'r') as f:
+        stats = json.load(f)
+    return stats
+
+def load_all_statistics(months: List[str], sub_area: int, data_dir: Path) -> List[Dict[str, float]]:
+    """
+    Load NDVI statistics for multiple months and a specific sub-area.
 
     Parameters
     ----------
-    stats_list : List[Dict]
-        List of statistics dictionaries sorted by year.
+    months : List[str]
+        List of months in 'YYYY-MM' format.
+    sub_area : int
+        Sub-area number.
+    data_dir : Path
+        Path to the data directory.
+
+    Returns
+    -------
+    List[Dict[str, float]]
+        List of dictionaries containing NDVI statistics per month.
+    """
+    stats_list = []
+    for month in months:
+        try:
+            stats = load_statistics(month, sub_area, data_dir)
+            stats['month'] = month
+            stats_list.append(stats)
+        except FileNotFoundError as e:
+            logger.warning(e)
+            continue
+    return stats_list
+
+def compute_trends(stats_list: List[Dict[str, float]]) -> Dict[str, float]:
+    """
+    Compute NDVI trends from a list of statistics.
+
+    Parameters
+    ----------
+    stats_list : List[Dict[str, float]]
+        List of statistics dictionaries per month.
 
     Returns
     -------
     Dict[str, float]
-        Dictionary with trend slopes for each metric.
+        Dictionary containing computed trends for various NDVI metrics.
+
+    Raises
+    ------
+    ValueError
+        If the statistics list is empty.
     """
     if not stats_list:
-        logger.error("Statistics list is empty. Cannot compute trends.")
-        return {}
+        logger.error("Statistics list is empty.")
+        raise ValueError("Statistics list is empty.")
+    
+    # Ensure that all stats have the required keys
+    required_keys = ["mean_ndvi", "median_ndvi", "std_dev_ndvi", "min_ndvi", "max_ndvi", "count_valid_pixels"]
+    for stat in stats_list:
+        for rk in required_keys:
+            if rk not in stat:
+                logger.error(f"Key {rk} not found in statistics.")
+                raise ValueError("Invalid statistics structure.")
 
-    # Convert to DataFrame for easier manipulation
-    df = pd.DataFrame(stats_list)
-    df = df.sort_values('year')
-
+    df = np.array([[
+        stat['mean_ndvi'], 
+        stat['median_ndvi'], 
+        stat['std_dev_ndvi'], 
+        stat['min_ndvi'], 
+        stat['max_ndvi'], 
+        stat['count_valid_pixels']
+    ] for stat in stats_list])
+    
+    # Compute linear trend (slope) for each metric
+    x = np.arange(len(df))
     trends = {}
-    metrics = ['mean_ndvi', 'median_ndvi', 'std_ndvi', 'min_ndvi', 'max_ndvi']
-
-    for metric in metrics:
-        if metric in df.columns:
-            slope, intercept, r_value, p_value, std_err = stats.linregress(df['year'], df[metric])
-            trends[metric] = slope
-            logger.info(f"Trend for {metric}: Slope = {slope:.4f}, R-squared = {r_value**2:.4f}")
-        else:
-            logger.warning(f"Metric '{metric}' not found in statistics data.")
+    metrics = ["mean_ndvi", "median_ndvi", "std_dev_ndvi", "min_ndvi", "max_ndvi", "count_valid_pixels"]
+    for i, m in enumerate(metrics):
+        slope, _ = np.polyfit(x, df[:, i], 1)
+        trends[f"trend_{m}"] = slope
 
     return trends
