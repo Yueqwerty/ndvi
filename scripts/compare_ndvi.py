@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Compare NDVI Data Across Multiple Months or Sub-Areas
+Compare Seasonal NDVI Data Across Multiple Years and Visualize Changes
 
-This script compares aggregated monthly NDVI data across multiple months or
-different sub-areas to identify trends, anomalies, or significant changes in
-vegetation health.
+This script compares aggregated seasonal NDVI data across multiple years for a specific
+sub-area to identify trends, anomalies, or significant changes in vegetation health.
 
 Usage:
-    python scripts/compare_ndvi.py YYYY-MM1 YYYY-MM2 ... [--sub_area SUB_AREA_NUMBER] [--method METHOD] [--output OUTPUT_PATH]
+    python scripts/compare_ndvi.py <season> <year1> <year2> ... --sub_area <sub_area_number> [--output OUTPUT_PATH]
 """
 
 import argparse
@@ -17,130 +16,150 @@ from typing import Dict, Optional, List
 
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from loguru import logger
 
-from analysis.statistics import load_all_statistics, compute_trends
+from config import SEASONS  # Import SEASONS dictionary
 
-def compare_multiple_months(months: List[str], sub_area: int, data_dir: Path, method: str) -> Dict[str, float]:
+def load_seasonal_ndvi_files(season: str, years: List[int], sub_area: int, data_dir: Path) -> Dict[int, np.ndarray]:
     """
-    Compara múltiples meses y calcula tendencias de NDVI.
+    Load aggregated seasonal NDVI files for specified years and sub-area.
 
     Parameters
     ----------
-    months : List[str]
-        Lista de meses en formato 'YYYY-MM'.
+    season : str
+        Season name.
+    years : List[int]
+        List of years.
     sub_area : int
-        Número de sub-área.
+        Sub-area number.
     data_dir : Path
-        Ruta al directorio de datos.
-    method : str
-        Método de comparación.
+        Path to the processed NDVI data directory.
 
     Returns
     -------
-    Dict[str, float]
-        Diccionario con tendencias calculadas.
+    Dict[int, np.ndarray]
+        Dictionary mapping year to NDVI array.
     """
-    stats_list = load_all_statistics(months, sub_area, data_dir)
-    trends = compute_trends(stats_list)
-    return trends
+    ndvi_years = {}
+    for year in years:
+        ndvi_path = data_dir / f"ndvi_{season}_{year}_sub_area_{sub_area}.npy"
+        if ndvi_path.exists():
+            ndvi = np.load(ndvi_path)
+            ndvi_years[year] = ndvi
+            logger.debug(f"Loaded NDVI for {season} {year}, Sub-area {sub_area} from {ndvi_path}")
+        else:
+            logger.warning(f"Aggregated NDVI file not found: {ndvi_path}")
+    return ndvi_years
 
-def plot_trends(trends: Dict[str, float], method: str, output_path: Path) -> None:
+def compute_ndvi_change(ndvi_current: np.ndarray, ndvi_previous: np.ndarray) -> np.ndarray:
     """
-    Plotea las tendencias de NDVI.
+    Compute the change in NDVI between two years.
 
     Parameters
     ----------
-    trends : Dict[str, float]
-        Diccionario con tendencias calculadas.
-    method : str
-        Método de comparación.
-    output_path : Path
-        Ruta para guardar el gráfico.
+    ndvi_current : np.ndarray
+        NDVI array for the current year.
+    ndvi_previous : np.ndarray
+        NDVI array for the previous year.
+
+    Returns
+    -------
+    np.ndarray
+        NDVI change array.
     """
-    metrics = list(trends.keys())
-    values = list(trends.values())
-    
-    plt.figure(figsize=(12, 6))
-    bars = plt.bar(metrics, values, color='seagreen')
-    plt.xlabel('Métricas NDVI')
-    plt.ylabel('Tendencia')
-    plt.title(f'Tendencias de NDVI ({method.capitalize()})')
-    
-    # Anotar barras con valores
-    for bar in bars:
-        height = bar.get_height()
-        plt.annotate(f'{height:.4f}',
-                     xy=(bar.get_x() + bar.get_width() / 2, height),
-                     xytext=(0, 3),  # Desplazamiento vertical de 3 puntos
-                     textcoords="offset points",
-                     ha='center', va='bottom')
-    
-    plt.xticks(rotation=45)
+    change = ndvi_current - ndvi_previous
+    # Handle NaNs by setting them to zero
+    change = np.where(np.isnan(change), 0, change)
+    return change
+
+def plot_heatmap(change: np.ndarray, output_path: Path, title: str) -> None:
+    """
+    Generate and save a heatmap of NDVI changes.
+
+    Parameters
+    ----------
+    change : np.ndarray
+        NDVI change array.
+    output_path : Path
+        Path to save the heatmap image.
+    title : str
+        Title of the heatmap.
+    """
+    plt.figure(figsize=(12, 10))
+    cmap = sns.diverging_palette(220, 20, as_cmap=True)
+    sns.heatmap(change, cmap=cmap, center=0, cbar_kws={'label': 'NDVI Change'})
+    plt.title(title, fontsize=16)
+    plt.xlabel('Longitude', fontsize=12)
+    plt.ylabel('Latitude', fontsize=12)
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=300)
     plt.close()
-    logger.info(f"Gráfico de tendencias guardado en {output_path}")
+    logger.info(f"Heatmap saved to {output_path}")
 
 def main():
     """
     Entry point of the compare_ndvi.py script.
     """
     parser = argparse.ArgumentParser(
-        description="Compare aggregated NDVI data across multiple months or sub-areas."
+        description="Compare aggregated seasonal NDVI data across multiple years for a specific sub-area and visualize changes."
     )
     parser.add_argument(
-        "months",
+        "season",
         type=str,
+        choices=SEASONS.keys(),
+        help="Season to compare (e.g., spring)."
+    )
+    parser.add_argument(
+        "years",
+        type=int,
         nargs='+',
-        help="Lista de meses para comparación en formato YYYY-MM."
+        help="List of years to compare (e.g., 2018 2019 2020)."
     )
     parser.add_argument(
         "--sub_area",
         type=int,
-        default=None,
-        help="Número de sub-área para comparar. Si no se proporciona, se compararán todas las sub-áreas individualmente."
+        required=True,
+        help="Sub-area number."
     )
     parser.add_argument(
-        "--method",
+        "--data_dir",
         type=str,
-        choices=["trend"],
-        default="trend",
-        help="Método de comparación a usar. Actualmente solo 'trend' está soportado."
+        default="data/processed/ndvi",
+        help="Path to the processed NDVI data directory."
     )
     parser.add_argument(
-        "--output",
+        "--output_dir",
         type=str,
-        default=None,
-        help="Ruta para guardar el gráfico. Si no se proporciona, se guardará en 'results/comparisons/'."
+        default="results/comparisons",
+        help="Path to save the heatmap images."
     )
 
     args = parser.parse_args()
 
-    # Definir directorios del proyecto
-    SCRIPT_DIR = Path(__file__).resolve().parent  # scripts/
-    PROJECT_ROOT = SCRIPT_DIR.parent  # proyecto_ndvi/
-    DATA_DIR = PROJECT_ROOT / 'data'  # proyecto_ndvi/data/
-    RESULTS_DIR = PROJECT_ROOT / 'results' / 'comparisons'
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    season = args.season
+    years = sorted(args.years)
+    sub_area = args.sub_area
+    data_dir = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not args.sub_area:
-        logger.error("Se debe especificar una sub-área con --sub_area para comparación múltiple de meses.")
-        sys.exit(1)
+    logger.info(f"Comparing NDVI for {season.capitalize()} across years {years} in Sub-area {sub_area}.")
 
-    # Comparar múltiples meses
-    trends = compare_multiple_months(args.months, args.sub_area, DATA_DIR, args.method)
+    # Load NDVI data for each year
+    ndvi_years = load_seasonal_ndvi_files(season, years, sub_area, data_dir)
 
-    # Definir ruta de salida
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        months_str = '_vs_'.join(args.months)
-        output_filename = f"ndvi_trends_{months_str}_sub_area_{args.sub_area}.png"
-        output_path = RESULTS_DIR / output_filename
-
-    # Plotear tendencias
-    plot_trends(trends, args.method, output_path)
+    # Compare consecutive years
+    for i in range(1, len(years)):
+        year_prev = years[i - 1]
+        year_curr = years[i]
+        if year_prev in ndvi_years and year_curr in ndvi_years:
+            change = compute_ndvi_change(ndvi_years[year_curr], ndvi_years[year_prev])
+            title = f"NDVI Change: {season.capitalize()} {year_prev} to {year_curr} (Sub-area {sub_area})"
+            output_path = output_dir / f"ndvi_change_{season}_{year_prev}_to_{year_curr}_sub_area_{sub_area}.png"
+            plot_heatmap(change, output_path, title)
+        else:
+            logger.warning(f"Insufficient NDVI data to compare {year_prev} and {year_curr}.")
 
 if __name__ == "__main__":
     main()

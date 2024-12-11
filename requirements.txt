@@ -1,5 +1,3 @@
-# requirements.txt
-
 # Existing dependencies
 aiohttp
 numpy
@@ -11,6 +9,10 @@ loguru
 dash
 plotly
 python-dotenv
+streamlit
+seaborn
+matplotlib
+scipy
 
 # Sphinx and extensions
 sphinx

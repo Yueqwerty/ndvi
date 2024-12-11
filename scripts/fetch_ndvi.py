@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-Fetch NDVI Data for a Specific Month without Cloud Masking
+Enhanced Fetch NDVI Script with Cloud Masking and Seasonal Best Image Selection
 
-This script downloads Landsat-8 NDVI data for all days of a specific month,
-aggregates the valid NDVI data to form a monthly representation without applying a cloud mask.
+This script fetches Landsat-8 NDVI data for specified seasons and sub-areas,
+applies cloud masking using a custom Evalscript, evaluates image quality based on
+validated (cloud-free) pixels, and selects the best images per season for further analysis.
 
 Usage:
-    python scripts/fetch_ndvi.py YYYY-MM
+    python scripts/fetch_ndvi.py <YEAR> <SEASON> [--sub_areas SUB_AREA_NUMBERS] [--evalscript EVALSCRIPT_PATH]
 """
 
+import argparse
 import asyncio
-import aiohttp
+import calendar
+import json
 import os
 import sys
-import json
-import calendar
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
+import aiohttp
 import numpy as np
 import rasterio
 from loguru import logger
@@ -26,7 +27,7 @@ from shapely.geometry import Polygon, box
 from pyproj import Transformer
 from dotenv import load_dotenv
 
-from utils import save_ndvi_as_geotiff  # Ensure this import from utils.py
+from utils.utils import save_ndvi_as_geotiff, load_evalscript, divide_aoi_grid, calculate_output_dimensions
 
 # Load environment variables from .env file
 load_dotenv()
@@ -36,24 +37,24 @@ SCRIPT_DIR = Path(__file__).resolve().parent  # scripts/
 PROJECT_ROOT = SCRIPT_DIR.parent  # proyecto_ndvi/
 DATA_DIR = PROJECT_ROOT / 'data'  # proyecto_ndvi/data/
 LOGS_DIR = PROJECT_ROOT / 'logs'  # proyecto_ndvi/logs/
+EVALSCRIPT_DIR = SCRIPT_DIR / 'evalscripts'  # scripts/evalscripts/
 
 # Ensure directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+EVALSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Configure Logging
 LOG_FILE = LOGS_DIR / 'fetch_ndvi.log'
-LOG_LEVEL = os.getenv("FETCH_NDVI_LOG_LEVEL", "DEBUG").upper()
-
 logger.remove()  # Remove default logger to prevent duplication
-logger.add(LOG_FILE, rotation="1 MB", retention="7 days", level=LOG_LEVEL)
-logger.add(sys.stdout, level=LOG_LEVEL)  # Add console logging
+logger.add(LOG_FILE, rotation="1 MB", retention="7 days", level="DEBUG")
+logger.add(sys.stdout, level="INFO")  # Add console logging
 
 # Sentinel Hub Configuration
-CLIENT_ID = "c1326a3f-464d-4e4b-897a-4ca6281ffc2d"
-CLIENT_SECRET = "NNZzqTVR5DWQraGNCFTR5O0AHLypxKQg"
+CLIENT_ID = os.getenv("SENTINELHUB_CLIENT_ID")
+CLIENT_SECRET = os.getenv("SENTINELHUB_CLIENT_SECRET")
 TOKEN_URL = os.getenv("SENTINELHUB_TOKEN_URL", "https://services.sentinel-hub.com/oauth/token")
-PROCESS_URL = os.getenv("SENTINELHUB_PROCESS_URL", "https://services-uswest2.sentinel-hub.com/api/v1/process")
+PROCESS_URL = os.getenv("SENTINELHUB_PROCESS_URL", "https://services.sentinel-hub.com/api/v1/process")
 
 # Verify Credentials
 if not CLIENT_ID or not CLIENT_SECRET:
@@ -65,152 +66,42 @@ transformer_to_proj = Transformer.from_crs("epsg:4326", "epsg:32719", always_xy=
 transformer_to_wgs84 = Transformer.from_crs("epsg:32719", "epsg:4326", always_xy=True)
 
 # Configuration Parameters
-MAX_CONCURRENT_REQUESTS = 2  # Further reduced to minimize rate limiting
-MAX_CONSECUTIVE_FAILURES = 3  # Reduced to skip quickly if no data
+MAX_CONCURRENT_REQUESTS = 2  # Adjust based on API limits
+MAX_CONSECUTIVE_FAILURES = 3  # Limit to skip problematic areas quickly
 BACKOFF_FACTOR = 2  # Exponential backoff factor
 
+# Define the seasons for the Southern Hemisphere
+SEASONS = {
+    "spring": [9, 10, 11],   # September, October, November
+    "summer": [12, 1, 2],    # December, January, February
+    "autumn": [3, 4, 5],     # March, April, May
+    "winter": [6, 7, 8],     # June, July, August
+}
+
 async def obtain_token(session: aiohttp.ClientSession) -> Optional[str]:
+    """
+    Obtain Sentinel Hub access token.
+    """
     token_data = {
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    max_retries = 5
-
-    for attempt in range(max_retries):
-        try:
-            logger.info("Requesting access token from Sentinel Hub...")
-            async with session.post(TOKEN_URL, data=token_data, headers=headers, timeout=30) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info("Access token obtained successfully.")
-                    return data.get("access_token")
-                else:
-                    text = await response.text()
-                    logger.error(f"Failed to obtain token: {response.status} {text}")
-                    if response.status >= 500:
-                        # Retry on server errors
-                        await asyncio.sleep(BACKOFF_FACTOR ** attempt)
-                        continue
-                    else:
-                        return None
-        except aiohttp.ClientError as client_err:
-            logger.error(f"Client error while obtaining token: {client_err}")
-            await asyncio.sleep(BACKOFF_FACTOR ** attempt)
-        except asyncio.TimeoutError:
-            logger.error("Token request timed out.")
-            await asyncio.sleep(BACKOFF_FACTOR ** attempt)
-        except Exception as e:
-            logger.error(f"Unexpected error while obtaining token: {e}")
-            return None
-    logger.error("Exceeded maximum retries for obtaining token.")
-    return None
-
-def generate_evalscript() -> str:
-    """
-    Generates the EvalScript for calculating NDVI without cloud masking.
-
-    Returns
-    -------
-    str
-        EvalScript as a string.
-    """
-    return """
-    //VERSION=3
-    function setup() {
-        return {
-            input: ["B04", "B05"],
-            output: { bands: 1, sampleType: "FLOAT32" }
-        };
-    }
-
-    function evaluatePixel(sample) {
-        let denominator = (sample.B05 + sample.B04);
-        let ndvi = denominator !== 0 ? (sample.B05 - sample.B04) / denominator : 0;
-        return [ndvi];
-    }
-    """
-
-def divide_aoi_grid(aoi_polygon: Polygon, tile_size: float = 20000.0) -> List[Polygon]:
-    """
-    Divides the AOI into a grid of sub-areas of the specified size.
-
-    Parameters
-    ----------
-    aoi_polygon : Polygon
-        Shapely Polygon object representing the AOI in projected CRS.
-    tile_size : float, optional
-        Size of each sub-area in meters, by default 20000.0 (20 km).
-
-    Returns
-    -------
-    List[Polygon]
-        List of Shapely Polygon objects representing sub-areas.
-    """
-    minx, miny, maxx, maxy = aoi_polygon.bounds
-    width = maxx - minx
-    height = maxy - miny
-
-    num_tiles_x = int(np.ceil(width / tile_size))
-    num_tiles_y = int(np.ceil(height / tile_size))
-
-    tiles = []
-    for i in range(num_tiles_x):
-        for j in range(num_tiles_y):
-            tile_minx = minx + i * tile_size
-            tile_miny = miny + j * tile_size
-            tile_maxx = min(tile_minx + tile_size, maxx)
-            tile_maxy = min(tile_miny + tile_size, maxy)
-            tile = box(tile_minx, tile_miny, tile_maxx, tile_maxy)
-            intersection = aoi_polygon.intersection(tile)
-            if not intersection.is_empty and isinstance(intersection, Polygon):
-                tiles.append(intersection)
-    return tiles
-
-def calculate_output_dimensions(tile_polygon: Polygon, max_meters_per_pixel: float = 30.0) -> Tuple[int, int]:
-    """
-    Calculates the output width and height in pixels for the given sub-area.
-
-    Parameters
-    ----------
-    tile_polygon : Polygon
-        Shapely Polygon object representing the sub-area in projected CRS.
-    max_meters_per_pixel : float, optional
-        Maximum meters per pixel, by default 30.0.
-
-    Returns
-    -------
-    Tuple[int, int]
-        Tuple containing (width_pixels, height_pixels).
-    """
-    minx, miny, maxx, maxy = tile_polygon.bounds
-    width_meters = maxx - minx
-    height_meters = maxy - miny
-
-    width_pixels = max(int(np.ceil(width_meters / max_meters_per_pixel)), 1)
-    height_pixels = max(int(np.ceil(height_meters / max_meters_per_pixel)), 1)
-
-    return width_pixels, height_pixels
-
-def get_all_dates(year: int, month: int) -> List[str]:
-    """
-    Retrieves all dates for a specific year and month.
-
-    Parameters
-    ----------
-    year : int
-        Year as an integer.
-    month : int
-        Month as an integer.
-
-    Returns
-    -------
-    List[str]
-        List of date strings in YYYY-MM-DD format.
-    """
-    num_days = calendar.monthrange(year, month)[1]
-    return [f"{year}-{month:02d}-{day:02d}" for day in range(1, num_days + 1)]
+    try:
+        async with session.post(TOKEN_URL, data=token_data, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                token = data.get("access_token")
+                logger.info("Successfully obtained access token.")
+                return token
+            else:
+                text = await response.text()
+                logger.error(f"Failed to obtain token: {response.status} {text}")
+                return None
+    except Exception as e:
+        logger.error(f"Exception while obtaining token: {e}")
+        return None
 
 async def request_ndvi_landsat8(
     session: aiohttp.ClientSession,
@@ -221,36 +112,12 @@ async def request_ndvi_landsat8(
     sub_area_number: int,
     width_pixels: int,
     height_pixels: int,
-    consecutive_failures: int
+    consecutive_failures: int,
+    attempt: int = 1
 ) -> Tuple[Optional[bytes], int]:
     """
-    Requests Landsat-8 NDVI data from Sentinel Hub for a specific sub-area and date.
-
-    Parameters
-    ----------
-    session : aiohttp.ClientSession
-        aiohttp session object.
-    token : str
-        Sentinel Hub access token.
-    polygon_coords : List[Tuple[float, float]]
-        List of coordinates defining the sub-area polygon.
-    date : str
-        Target date in YYYY-MM-DD format.
-    evalscript : str
-        EvalScript for calculating NDVI without cloud masking.
-    sub_area_number : int
-        Identifier for the sub-area.
-    width_pixels : int
-        Output image width in pixels.
-    height_pixels : int
-        Output image height in pixels.
-    consecutive_failures : int
-        Current count of consecutive failed requests.
-
-    Returns
-    -------
-    Tuple[Optional[bytes], int]
-        NDVI GeoTIFF data as bytes or None if the request fails, and updated consecutive_failures count.
+    Request Landsat-8 NDVI data from Sentinel Hub API for a specific sub-area and date.
+    Implements exponential backoff for retries.
     """
     request_payload = {
         "input": {
@@ -265,7 +132,7 @@ async def request_ndvi_landsat8(
             },
             "data": [
                 {
-                    "type": "landsat-ot-l1",  # Correct data collection type
+                    "type": "landsat-ot-l1",  # Sentinel Hub data type
                     "dataFilter": {
                         "timeRange": {
                             "from": f"{date}T00:00:00Z",
@@ -299,38 +166,161 @@ async def request_ndvi_landsat8(
     }
 
     try:
-        logger.info(f"Requesting Landsat-8 NDVI for sub-area {sub_area_number} on {date}...")
+        logger.debug(f"Requesting NDVI for Sub-area {sub_area_number} on {date}, Attempt {attempt}...")
         async with session.post(PROCESS_URL, json=request_payload, headers=headers, timeout=600) as response:
             content_type = response.headers.get("Content-Type", "").lower()
             if response.status == 200 and ("image/tiff" in content_type or "application/octet-stream" in content_type):
                 content = await response.read()
-                logger.debug(f"Received NDVI data for sub-area {sub_area_number} on {date}.")
+                logger.debug(f"Successfully fetched NDVI for Sub-area {sub_area_number} on {date}.")
                 return content, 0  # Reset failure count on success
             elif response.status == 429:
                 # Handle rate limiting
-                logger.warning(f"Rate limit exceeded for sub-area {sub_area_number} on {date}.")
+                logger.warning(f"Rate limit exceeded for Sub-area {sub_area_number} on {date}.")
                 return None, consecutive_failures + 1
             elif response.status >= 500:
                 # Server error, may retry
-                logger.warning(f"Server error {response.status} for sub-area {sub_area_number} on {date}.")
+                logger.warning(f"Server error {response.status} for Sub-area {sub_area_number} on {date}.")
                 return None, consecutive_failures + 1
             else:
                 text = await response.text()
-                logger.error(f"Failed request for Landsat-8 NDVI for sub-area {sub_area_number} on {date}: {response.status} {text}")
-                # Save error response for debugging
+                logger.error(f"Failed request for NDVI for Sub-area {sub_area_number} on {date}: {response.status} {text}")
+                # Optionally, save error response for debugging
                 error_path = DATA_DIR / "raw" / "ndvi" / date / f"sub_area_{sub_area_number}" / "error_response.txt"
                 error_path.parent.mkdir(parents=True, exist_ok=True)
                 error_path.write_text(text)
                 return None, consecutive_failures + 1
     except asyncio.TimeoutError:
-        logger.error(f"Landsat-8 request timed out for sub-area {sub_area_number} on {date}.")
-        return None, consecutive_failures + 1
+        logger.error(f"NDVI request timed out for Sub-area {sub_area_number} on {date}.")
+        if attempt < MAX_CONSECUTIVE_FAILURES:
+            sleep_time = BACKOFF_FACTOR ** attempt
+            logger.info(f"Retrying after {sleep_time} seconds...")
+            await asyncio.sleep(sleep_time)
+            return await request_ndvi_landsat8(
+                session,
+                token,
+                polygon_coords,
+                date,
+                evalscript,
+                sub_area_number,
+                width_pixels,
+                height_pixels,
+                consecutive_failures,
+                attempt + 1
+            )
+        else:
+            logger.error(f"Exceeded maximum retries for Sub-area {sub_area_number} on {date}.")
+            return None, consecutive_failures + 1
     except aiohttp.ClientError as client_err:
-        logger.error(f"Client error during Landsat-8 request for sub-area {sub_area_number} on {date}: {client_err}.")
+        logger.error(f"Client error during NDVI request for Sub-area {sub_area_number} on {date}: {client_err}.")
         return None, consecutive_failures + 1
     except Exception as e:
-        logger.error(f"Unexpected error during Landsat-8 request for sub-area {sub_area_number} on {date}: {e}")
+        logger.error(f"Unexpected error during NDVI request for Sub-area {sub_area_number} on {date}: {e}")
         return None, consecutive_failures + 1
+
+def refine_cloud_mask(cloud_mask: np.ndarray) -> np.ndarray:
+    """
+    Refine the cloud mask using morphological operations.
+
+    Parameters
+    ----------
+    cloud_mask : np.ndarray
+        Binary cloud mask array.
+
+    Returns
+    -------
+    np.ndarray
+        Refined cloud mask array.
+    """
+    from scipy.ndimage import binary_erosion, binary_dilation, median_filter
+
+    # Remove small artifacts
+    cloud_mask = binary_erosion(cloud_mask, structure=np.ones((3,3))).astype(int)
+    cloud_mask = binary_dilation(cloud_mask, structure=np.ones((3,3))).astype(int)
+    
+    # Apply median filter to smooth edges
+    cloud_mask = median_filter(cloud_mask, size=3)
+    
+    return cloud_mask
+
+def evaluate_image_quality(ndvi: np.ndarray) -> int:
+    """
+    Evaluate the quality of an NDVI image based on the number of valid pixels.
+
+    Parameters
+    ----------
+    ndvi : np.ndarray
+        NDVI array.
+
+    Returns
+    -------
+    int
+        Number of valid (cloud-free) pixels.
+    """
+    return np.count_nonzero(~np.isnan(ndvi))
+
+def select_best_images(ndvi_list: List[np.ndarray], top_n: int = 3) -> List[np.ndarray]:
+    """
+    Select the best NDVI images based on the number of valid pixels.
+
+    Parameters
+    ----------
+    ndvi_list : List[np.ndarray]
+        List of NDVI arrays for the season.
+    top_n : int, optional
+        Number of top images to select, by default 3.
+
+    Returns
+    -------
+    List[np.ndarray]
+        List of top NDVI arrays with the highest number of valid pixels.
+    """
+    if not ndvi_list:
+        logger.error("NDVI list is empty. Cannot select images.")
+        return []
+
+    quality_scores = [evaluate_image_quality(ndvi) for ndvi in ndvi_list]
+    sorted_indices = np.argsort(quality_scores)[::-1]  # Descending order
+    best_indices = sorted_indices[:top_n]
+    best_images = [ndvi_list[i] for i in best_indices]
+    logger.info(f"Selected top {len(best_images)} images with the highest number of valid pixels.")
+    return best_images
+
+def aggregate_seasonal_ndvi(best_images: List[np.ndarray], method: str = "mean") -> np.ndarray:
+    """
+    Aggregate selected NDVI images to form a seasonal representation.
+
+    Parameters
+    ----------
+    best_images : List[np.ndarray]
+        List of top NDVI arrays.
+    method : str, optional
+        Aggregation method ('mean', 'median', 'max'), by default "mean".
+
+    Returns
+    -------
+    np.ndarray
+        Aggregated seasonal NDVI array.
+    """
+    if not best_images:
+        logger.error("No images to aggregate.")
+        return np.array([])
+
+    # Stack images along a new axis
+    stacked_ndvi = np.stack(best_images, axis=0)
+
+    # Aggregate using the specified method
+    if method == "mean":
+        seasonal_ndvi = np.nanmean(stacked_ndvi, axis=0)
+    elif method == "median":
+        seasonal_ndvi = np.nanmedian(stacked_ndvi, axis=0)
+    elif method == "max":
+        seasonal_ndvi = np.nanmax(stacked_ndvi, axis=0)
+    else:
+        logger.error(f"Invalid aggregation method: {method}. Using 'mean' by default.")
+        seasonal_ndvi = np.nanmean(stacked_ndvi, axis=0)
+
+    logger.info(f"Seasonal NDVI aggregation completed using method '{method}'.")
+    return seasonal_ndvi
 
 async def process_sub_area(
     session: aiohttp.ClientSession,
@@ -338,25 +328,24 @@ async def process_sub_area(
     dates: List[str],
     evalscript: str,
     token: str,
-    month_path: Path
+    raw_ndvi_path: Path
 ) -> None:
     """
-    Processes a specific sub-area by requesting NDVI data for all valid days of the month,
-    aggregating the valid NDVI data to form a monthly representation without cloud masking.
+    Process a single sub-area by fetching, masking clouds, and aggregating NDVI data.
 
     Parameters
     ----------
     session : aiohttp.ClientSession
-        aiohttp session object.
+        The aiohttp session to use for requests.
     sub_area : Dict
         Dictionary containing sub-area details.
     dates : List[str]
-        List of date strings in YYYY-MM-DD format.
+        List of date strings in 'YYYY-MM-DD' format.
     evalscript : str
-        EvalScript for calculating NDVI without cloud masking.
+        The Evalscript for NDVI calculation with cloud masking.
     token : str
         Sentinel Hub access token.
-    month_path : Path
+    raw_ndvi_path : Path
         Path to save the aggregated monthly NDVI data.
     """
     sub_area_number = sub_area['number']
@@ -365,11 +354,12 @@ async def process_sub_area(
     height_pixels = sub_area['height_pixels']
 
     ndvi_values = []
+    cloud_masks = []
     consecutive_failures = 0  # Initialize failure counter
 
     for date in dates:
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-            logger.warning(f"Maximum consecutive failures reached for sub-area {sub_area_number}. Skipping remaining dates.")
+            logger.warning(f"Maximum consecutive failures reached for Sub-area {sub_area_number}. Skipping remaining dates.")
             break
 
         ndvi_landsat, consecutive_failures = await request_ndvi_landsat8(
@@ -389,76 +379,77 @@ async def process_sub_area(
                 with rasterio.MemoryFile(ndvi_landsat) as memfile:
                     with memfile.open() as dataset:
                         ndvi_data = dataset.read(1)
-                        # Replace noDataValue with np.nan for aggregation
-                        ndvi_data = np.where(ndvi_data == 0, np.nan, ndvi_data)
-                        ndvi_values.append(ndvi_data)
-                logger.debug(f"NDVI data for sub-area {sub_area_number} on {date} aggregated for monthly aggregation.")
+                        # Assuming cloud pixels are marked as 1 and no cloud as 0
+                        cloud_mask = np.where(ndvi_data == 1, 1, 0)
+                        # Refine the cloud mask
+                        cloud_mask = refine_cloud_mask(cloud_mask)
+                        # Mask out cloud pixels
+                        ndvi_valid = np.where(cloud_mask == 1, np.nan, ndvi_data)
+                        ndvi_values.append(ndvi_valid)
+                        cloud_masks.append(cloud_mask)
+                logger.debug(f"NDVI and cloud mask data for Sub-area {sub_area_number} on {date} aggregated.")
             except Exception as e:
-                logger.error(f"Error processing NDVI data for sub-area {sub_area_number} on {date}: {e}")
+                logger.error(f"Error processing NDVI data for Sub-area {sub_area_number} on {date}: {e}")
         else:
-            logger.warning(f"No NDVI data obtained for sub-area {sub_area_number} on {date}.")
+            logger.warning(f"No NDVI data obtained for Sub-area {sub_area_number} on {date}.")
 
     if not ndvi_values:
-        logger.error(f"No valid NDVI data found for sub-area {sub_area_number} in the month.")
+        logger.error(f"No valid NDVI data found for Sub-area {sub_area_number} in the specified dates.")
         return
 
-    # Aggregate NDVI data (e.g., mean)
+    # Aggregate NDVI data using masked values (e.g., mean)
     aggregated_ndvi = np.nanmean(ndvi_values, axis=0)
-    logger.info(f"Aggregated NDVI data for sub-area {sub_area_number}.")
+    logger.info(f"Aggregated NDVI data for Sub-area {sub_area_number}.")
+
+    # Validate NDVI data
+    if not np.isfinite(aggregated_ndvi).any():
+        logger.error(f"Aggregated NDVI data invalid for Sub-area {sub_area_number}. Skipping save.")
+        return
 
     # Save aggregated NDVI as `.npy`
-    ndvi_npy_path = month_path / f"sub_area_{sub_area_number}" / "ndvi_monthly.npy"
+    ndvi_npy_path = raw_ndvi_path / f"sub_area_{sub_area_number}" / "ndvi_monthly.npy"
     try:
         ndvi_npy_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(ndvi_npy_path, aggregated_ndvi)
         logger.info(f"Aggregated monthly NDVI saved to {ndvi_npy_path}")
     except IOError as io_err:
-        logger.error(f"Error saving aggregated NDVI for sub-area {sub_area_number}: {io_err}")
+        logger.error(f"Error saving aggregated NDVI for Sub-area {sub_area_number}: {io_err}")
 
-    # Optionally, save aggregated NDVI as GeoTIFF
+    # Optionally: Save aggregated NDVI as GeoTIFF
     sub_area_bounds = sub_area.get('bounds')
     if sub_area_bounds:
-        geotiff_path = month_path / f"sub_area_{sub_area_number}" / "ndvi_monthly.tif"
+        geotiff_path = raw_ndvi_path / f"sub_area_{sub_area_number}" / "ndvi_monthly.tif"
         try:
             save_ndvi_as_geotiff(aggregated_ndvi, geotiff_path, sub_area_bounds)
+            logger.info(f"Aggregated monthly NDVI GeoTIFF saved to {geotiff_path}")
         except Exception as e:
-            logger.error(f"Error saving aggregated monthly NDVI GeoTIFF for sub-area {sub_area_number}: {e}")
+            logger.error(f"Error saving aggregated monthly NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
+    else:
+        logger.warning(f"Bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")
 
-async def process_sub_area_with_semaphore(semaphore, session, sub_area, dates, evalscript, token, month_path):
+async def process_sub_area_with_semaphore(semaphore, session, sub_area, dates, evalscript, token, raw_ndvi_path):
     """
     Wrapper to process a sub-area with semaphore control.
-
-    Parameters
-    ----------
-    semaphore : asyncio.Semaphore
-        Semaphore object to limit concurrent requests.
-    session : aiohttp.ClientSession
-        aiohttp session object.
-    sub_area : Dict
-        Dictionary containing sub-area details.
-    dates : List[str]
-        List of date strings in YYYY-MM-DD format.
-    evalscript : str
-        EvalScript for calculating NDVI without cloud masking.
-    token : str
-        Sentinel Hub access token.
-    month_path : Path
-        Path to save the aggregated monthly NDVI data.
     """
     async with semaphore:
-        await process_sub_area(session, sub_area, dates, evalscript, token, month_path)
+        await process_sub_area(session, sub_area, dates, evalscript, token, raw_ndvi_path)
 
-async def main_async(year: int, month: int) -> None:
+async def main_async(
+    year: int,
+    season: str,
+    sub_areas: Optional[List[int]],
+    top_n: int,
+    method: str,
+    evalscript_path: Path,
+    data_dir: Path,
+    output_dir: Path
+) -> None:
     """
-    Asynchronous main function to process all sub-areas for a given month.
+    Asynchronous main function to process all sub-areas for a given season and perform seasonal aggregation.
+    """
+    # Load Evalscript
+    evalscript = load_evalscript(evalscript_path)
 
-    Parameters
-    ----------
-    year : int
-        Year as an integer.
-    month : int
-        Month as an integer.
-    """
     # Define AOI coordinates (WGS84)
     POLYGON_COORDINATES = [
         [
@@ -481,16 +472,16 @@ async def main_async(year: int, month: int) -> None:
         logger.info("Projected AOI geometry is valid.")
 
     # Divide AOI into sub-areas using grid
-    tile_size = 20000.0  # Increased tile size to reduce number of sub-areas
+    tile_size = 20000.0  # Tile size in meters
     sub_polygons = divide_aoi_grid(aoi_polygon_proj, tile_size=tile_size)
     logger.info(f"Number of sub-areas: {len(sub_polygons)}")
 
     # Prepare sub-areas with identifiers and output dimensions
-    sub_areas = []
+    sub_areas_list = []
     for idx, poly in enumerate(sub_polygons):
         width_pixels, height_pixels = calculate_output_dimensions(poly)
         coords_wgs84 = [transformer_to_wgs84.transform(x, y) for x, y in poly.exterior.coords]
-        sub_areas.append({
+        sub_areas_list.append({
             "number": idx + 1,
             "coords": coords_wgs84,
             "polygon": poly,
@@ -499,37 +490,57 @@ async def main_async(year: int, month: int) -> None:
             "bounds": poly.bounds  # (minx, miny, maxx, maxy) in projected CRS
         })
 
+    # Filter sub-areas if specified
+    if sub_areas:
+        sub_areas_list = [sa for sa in sub_areas_list if sa["number"] in sub_areas]
+        logger.info(f"Processing sub-areas: {sub_areas}")
+
     # Create a dictionary to store the bounds of each sub-area
     sub_area_bounds = {}
-    for sub_area in sub_areas:
-        sub_area_number = sub_area['number']
-        bounds = sub_area['bounds']
+    for sub_area_dict in sub_areas_list:
+        sub_area_number = sub_area_dict['number']
+        bounds = sub_area_dict['bounds']
         # Convert projected bounds to WGS84
         min_lon, min_lat = transformer_to_wgs84.transform(bounds[0], bounds[1])
         max_lon, max_lat = transformer_to_wgs84.transform(bounds[2], bounds[3])
         sub_area_bounds[str(sub_area_number)] = [min_lon, min_lat, max_lon, max_lat]
 
     # Save bounds to a JSON file
-    bounds_file = DATA_DIR / 'sub_area_bounds.json'
+    bounds_file = data_dir / 'sub_area_bounds.json'
     bounds_file.parent.mkdir(parents=True, exist_ok=True)
     with open(bounds_file, 'w') as f:
         json.dump(sub_area_bounds, f)
     logger.info(f"Sub-area bounds saved to {bounds_file}")
 
-    # Get all dates for the month
-    dates = get_all_dates(year, month)
-    logger.info(f"Total days to process for {year}-{month:02d}: {len(dates)}")
+    # Get all months in the specified season
+    months = SEASONS.get(season.lower())
+    if not months:
+        logger.error(f"Invalid season: {season}")
+        sys.exit(1)
+    logger.info(f"Months included in {season.capitalize()} {year}: {months}")
 
-    # Define path to save monthly data
-    month_str = f"{year}-{month:02d}"
-    month_path = DATA_DIR / "raw" / "ndvi" / month_str
-    month_path.mkdir(parents=True, exist_ok=True)
+    # Handle seasons that span two years (e.g., winter)
+    if season.lower() == "winter":
+        months_with_years = []
+        for m in months:
+            if m == 12:
+                months_with_years.append((year - 1, m))
+            else:
+                months_with_years.append((year, m))
+    else:
+        months_with_years = [(year, m) for m in months]
+
+    # Compile month strings in 'YYYY-MM' format
+    season_months = [f"{y}-{m:02d}" for y, m in months_with_years]
+    logger.info(f"Season '{season}' months: {season_months}")
+
+    # Define paths to save seasonal data
+    for month_str in season_months:
+        month_path = data_dir / "raw" / "ndvi" / month_str
+        month_path.mkdir(parents=True, exist_ok=True)
 
     # Create a semaphore to limit concurrent requests
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-    # Generate the EvalScript without cloud masking
-    evalscript = generate_evalscript()
 
     async with aiohttp.ClientSession() as session:
         token = await obtain_token(session)
@@ -537,42 +548,163 @@ async def main_async(year: int, month: int) -> None:
             logger.error("Failed to obtain Sentinel Hub access token.")
             sys.exit(1)
 
-        tasks = [
-            process_sub_area_with_semaphore(
-                semaphore,
-                session,
-                sub_area,
-                dates,
-                evalscript,
-                token,
-                month_path
-            )
-            for sub_area in sub_areas
-        ]
+        # Process each sub-area concurrently for all relevant months
+        tasks = []
+        for sub_area_dict in sub_areas_list:
+            for y, m in months_with_years:
+                month_str = f"{y}-{m:02d}"
+                # Get all dates in the month
+                num_days = calendar.monthrange(y, m)[1]
+                dates = [f"{y}-{m:02d}-{day:02d}" for day in range(1, num_days + 1)]
+                raw_ndvi_path = data_dir / "raw" / "ndvi" / month_str
+                tasks.append(
+                    asyncio.create_task(
+                        process_sub_area_with_semaphore(
+                            semaphore,
+                            session,
+                            sub_area_dict,
+                            dates,
+                            evalscript,
+                            token,
+                            raw_ndvi_path
+                        )
+                    )
+                )
         await asyncio.gather(*tasks)
 
     logger.info("NDVI data fetching and aggregation process completed successfully.")
 
-def main() -> None:
-    """
-    Entry point of the script.
-    """
-    import argparse
+    # Perform seasonal aggregation by selecting the best images
+    logger.info(f"Performing seasonal aggregation for {season.capitalize()} {year}.")
 
-    parser = argparse.ArgumentParser(description="Fetch and aggregate Landsat-8 NDVI data for a specific month without cloud masking.")
-    parser.add_argument("year_month", type=str, help="Target year and month in YYYY-MM format.")
+    for sub_area_dict in sub_areas_list:
+        sub_area_number = sub_area_dict["number"]
+        logger.info(f"Aggregating seasonal NDVI for Sub-area {sub_area_number}.")
+
+        # Load NDVI data for all months in the season
+        seasonal_ndvi_list = []
+        for month_str in season_months:
+            ndvi_file = data_dir / "raw" / "ndvi" / month_str / f"sub_area_{sub_area_number}" / "ndvi_monthly.npy"
+            if ndvi_file.exists():
+                ndvi = np.load(ndvi_file)
+                seasonal_ndvi_list.append(ndvi)
+                logger.debug(f"NDVI loaded from {ndvi_file}")
+            else:
+                logger.warning(f"NDVI file not found: {ndvi_file}")
+
+        # Select the best images based on valid pixels
+        best_images = select_best_images(seasonal_ndvi_list, top_n=top_n)
+
+        # Aggregate the best images
+        aggregated_seasonal_ndvi = aggregate_seasonal_ndvi(best_images, method=method)
+
+        if aggregated_seasonal_ndvi.size == 0:
+            logger.error(f"No data aggregated for Sub-area {sub_area_number}. Skipping save.")
+            continue
+
+        # Define output path for aggregated seasonal NDVI
+        aggregated_output_path = output_dir / "statistics" / f"ndvi_{season}_{year}_sub_area_{sub_area_number}.npy"
+        aggregated_output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            np.save(aggregated_output_path, aggregated_seasonal_ndvi)
+            logger.info(f"Aggregated seasonal NDVI saved to {aggregated_output_path}")
+        except IOError as io_err:
+            logger.error(f"Error saving aggregated seasonal NDVI for Sub-area {sub_area_number}: {io_err}")
+
+        # Optionally, save aggregated NDVI as GeoTIFF
+        bounds = sub_area_dict['bounds']
+        if bounds:
+            geotiff_path = output_dir / "statistics" / f"ndvi_{season}_{year}_sub_area_{sub_area_number}.tif"
+            try:
+                save_ndvi_as_geotiff(aggregated_seasonal_ndvi, geotiff_path, bounds)
+                logger.info(f"Aggregated seasonal NDVI GeoTIFF saved to {geotiff_path}")
+            except Exception as e:
+                logger.error(f"Error saving aggregated seasonal NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
+        else:
+            logger.warning(f"Bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")
+
+def main():
+    """
+    Entry point of the fetch_ndvi.py script.
+    """
+    parser = argparse.ArgumentParser(
+        description="Fetch and process Landsat-8 NDVI data with cloud masking and seasonal best image selection."
+    )
+    parser.add_argument(
+        "year",
+        type=int,
+        help="Target year as an integer (e.g., 2020)."
+    )
+    parser.add_argument(
+        "season",
+        type=str,
+        choices=SEASONS.keys(),
+        help="Season to process (e.g., spring)."
+    )
+    parser.add_argument(
+        "--sub_areas",
+        type=int,
+        nargs='+',
+        help="Sub-area number(s) to process. If not specified, all sub-areas will be processed."
+    )
+    parser.add_argument(
+        "--evalscript",
+        type=str,
+        default="evalscripts/cloud_masking_evalscript.js",
+        help="Path to the Evalscript file for cloud masking."
+    )
+    parser.add_argument(
+        "--top_n",
+        type=int,
+        default=3,
+        help="Number of top images to select per season based on validated pixels."
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["mean", "median", "max"],
+        default="mean",
+        help="Aggregation method to use for seasonal NDVI."
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="data",
+        help="Path to the data directory."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results/statistics",
+        help="Path to save the statistics JSON files and aggregated NDVI."
+    )
+
     args = parser.parse_args()
 
-    # Validate year_month format
-    try:
-        target_date = datetime.strptime(args.year_month, "%Y-%m")
-        year = target_date.year
-        month = target_date.month
-    except ValueError:
-        logger.error("Invalid year-month format. Use YYYY-MM.")
+    # Validate year
+    if args.year <= 0:
+        logger.error("Invalid year provided.")
         sys.exit(1)
 
-    asyncio.run(main_async(year, month))
+    # Validate Evalscript path
+    evalscript_path = Path(args.evalscript)
+    if not evalscript_path.exists():
+        logger.error(f"Evalscript file not found: {evalscript_path}")
+        sys.exit(1)
+
+    # Run the asynchronous main function
+    asyncio.run(
+        main_async(
+            year=args.year,
+            season=args.season,
+            sub_areas=args.sub_areas,
+            top_n=args.top_n,
+            method=args.method,
+            evalscript_path=evalscript_path,
+            data_dir=Path(args.data_dir),
+            output_dir=Path(args.output_dir)
+        )
+    )
 
 if __name__ == "__main__":
     main()

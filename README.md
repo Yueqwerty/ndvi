@@ -1,12 +1,15 @@
 # Proyecto NDVI
 
-**Proyecto NDVI** is a project aimed at analyzing and visualizing changes in the Normalized Difference Vegetation Index (NDVI) over time across various sub-areas. The project leverages satellite imagery data to monitor vegetation health and trends.
+**Proyecto NDVI** is a project aimed at analyzing and visualizing changes in the Normalized Difference Vegetation Index (NDVI) over time across various sub-areas in the Aysén region, specifically in Coyhaique. The project leverages satellite imagery data to monitor vegetation health and trends, accounting for the unique seasonal patterns of the Southern Hemisphere.
 
 ## Table of Contents
 
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Fetch and Process NDVI Data](#fetch-and-process-ndvi-data)
+  - [Compare Seasonal NDVI Changes](#compare-seasonal-ndvi-changes)
+  - [Interactive Visualization](#interactive-visualization)
 - [Project Structure](#project-structure)
 - [Documentation](#documentation)
 - [Contributing](#contributing)
@@ -16,6 +19,7 @@
 
 - **Data Fetching:** Retrieve NDVI data from Sentinel Hub API.
 - **Data Processing:** Aggregate and compute statistics for NDVI data.
+- **Seasonal Aggregation:** Select and aggregate the best images per season and year.
 - **Trend Analysis:** Calculate trends over time for various NDVI metrics.
 - **Visualization:** Generate heatmaps to visualize changes in NDVI.
 - **Interactive Dashboard:** Explore NDVI data through a Streamlit application.
@@ -59,9 +63,9 @@
 
 ## Usage
 
-### Fetch NDVI Data
+### Fetch and Process NDVI Data
 
-Run the script to fetch NDVI data for a specific month:
+Fetch NDVI data for a specific month and process it to compute statistical metrics. Optionally, perform seasonal aggregation.
 
 ```bash
-python scripts/fetch_ndvi.py YYYY-MM
+python scripts/process_ndvi.py <YYYY-MM> --sub_area <SUB_AREA_NUMBER> [--season <SEASON>] [--aggregate_season] [--method <mean|median|max>]

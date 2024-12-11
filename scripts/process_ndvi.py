@@ -1,70 +1,88 @@
 #!/usr/bin/env python3
 """
-Process Aggregated NDVI Data to Compute Statistical Metrics
+Process Aggregated Seasonal NDVI Data to Compute Statistical Metrics and Prepare for Analysis
 
-This script processes the aggregated monthly NDVI data to compute statistical
-metrics, identify trends, and prepare the data for further analysis.
+This script processes aggregated seasonal NDVI data to compute statistical metrics,
+ensuring the data is ready for further analysis or visualization.
 
 Usage:
-    python scripts/process_ndvi.py YYYY-MM [--sub_area SUB_AREA_NUMBER]
+    python scripts/process_ndvi.py <YEAR> <SEASON> [--sub_areas SUB_AREA_NUMBERS] [--method <mean|median|max>]
 """
+
 import argparse
-import os
-import sys
 import json
+import sys
 from pathlib import Path
 from typing import Optional, List, Dict
 
 import numpy as np
-import pandas as pd
 from loguru import logger
 
-def load_ndvi_data(data_dir: Path, month: str, sub_area: Optional[int] = None) -> np.ndarray:
+# Adjust the import path based on your project structure
+# Assuming 'utils' is a subpackage within 'scripts'
+from utils.utils import (
+    aggregate_seasonal_ndvi,
+    select_best_images,
+    save_ndvi_as_geotiff,
+    load_seasonal_ndvi,
+)
+
+
+# Configure Logging
+def configure_logging(log_file: Path, log_level: str = "DEBUG"):
     """
-    Load aggregated NDVI data for a specific month and sub-area.
+    Configure logging with loguru.
 
     Parameters
     ----------
+    log_file : Path
+        Path to the log file.
+    log_level : str, optional
+        Logging level, by default "DEBUG".
+    """
+    logger.remove()  # Remove default logger to prevent duplication
+    logger.add(log_file, rotation="1 MB", retention="7 days", level=log_level)
+    logger.add(sys.stdout, level="INFO")  # Add console logging
+
+
+def load_seasonal_ndvi(season_months: List[str], sub_area: int, data_dir: Path) -> List[np.ndarray]:
+    """
+    Load aggregated seasonal NDVI files for a specific sub-area.
+
+    Parameters
+    ----------
+    season_months : List[str]
+        List of month strings in 'YYYY-MM' format included in the season.
+    sub_area : int
+        Sub-area number.
     data_dir : Path
         Path to the data directory.
-    month : str
-        Target month in 'YYYY-MM' format.
-    sub_area : Optional[int], optional
-        Sub-area number, by default None (loads all sub-areas).
 
     Returns
     -------
-    np.ndarray
-        NDVI data array.
+    List[np.ndarray]
+        List of NDVI arrays.
     """
-    ndvi_path = data_dir / "raw" / "ndvi" / month
-    if sub_area:
-        ndvi_file = ndvi_path / f"sub_area_{sub_area}" / "ndvi_monthly.npy"
-        if not ndvi_file.exists():
-            logger.error(f"NDVI file not found: {ndvi_file}")
-            sys.exit(1)
-        return np.load(ndvi_file)
-    else:
-        # If no sub_area is specified, return a list of all sub-area NDVI arrays
-        sub_area_files = list(ndvi_path.glob("sub_area_*/ndvi_monthly.npy"))
-        if not sub_area_files:
-            logger.error(f"No NDVI data found for month {month}.")
-            sys.exit(1)
-        ndvi_data_list = []
-        for idx, f in enumerate(sub_area_files, start=1):
-            ndvi = np.load(f)
-            logger.debug(f"Sub-area {idx} NDVI shape: {ndvi.shape}")
-            ndvi_data_list.append(ndvi)
-        return ndvi_data_list
+    ndvi_list = []
+    for month in season_months:
+        ndvi_file = data_dir / "raw" / "ndvi" / month / f"sub_area_{sub_area}" / "ndvi_monthly.npy"
+        if ndvi_file.exists():
+            ndvi = np.load(ndvi_file)
+            ndvi_list.append(ndvi)
+            logger.debug(f"Loaded NDVI from {ndvi_file}")
+        else:
+            logger.warning(f"NDVI file not found: {ndvi_file}")
+    return ndvi_list
 
-def compute_statistics(ndvi_data: np.ndarray) -> Dict[str, float]:
+
+def compute_statistics(ndvi: np.ndarray) -> Dict[str, float]:
     """
-    Compute statistical metrics for NDVI data.
+    Compute statistical metrics for an NDVI array.
 
     Parameters
     ----------
-    ndvi_data : np.ndarray
-        NDVI data array.
+    ndvi : np.ndarray
+        NDVI array.
 
     Returns
     -------
@@ -72,94 +90,184 @@ def compute_statistics(ndvi_data: np.ndarray) -> Dict[str, float]:
         Dictionary containing statistical metrics.
     """
     stats = {
-        "mean_ndvi": np.nanmean(ndvi_data),
-        "median_ndvi": np.nanmedian(ndvi_data),
-        "std_ndvi": np.nanstd(ndvi_data),
-        "min_ndvi": np.nanmin(ndvi_data),
-        "max_ndvi": np.nanmax(ndvi_data),
-        "count_valid_pixels": np.count_nonzero(~np.isnan(ndvi_data))
+        "mean_ndvi": float(np.nanmean(ndvi)),
+        "median_ndvi": float(np.nanmedian(ndvi)),
+        "max_ndvi": float(np.nanmax(ndvi)),
+        "min_ndvi": float(np.nanmin(ndvi)),
+        "std_dev_ndvi": float(np.nanstd(ndvi))
     }
     return stats
 
-def save_statistics(
-    stats: Dict[str, float],
-    output_path: Path
-) -> None:
+
+def save_statistics(statistics: Dict[str, float], stats_path: Path) -> None:
     """
-    Save statistical metrics to a JSON file.
+    Save statistical metrics as a JSON file.
 
     Parameters
     ----------
-    stats : Dict[str, float]
-        Statistical metrics dictionary.
-    output_path : Path
-        Path to save the statistics JSON file.
+    statistics : Dict[str, float]
+        Statistical metrics.
+    stats_path : Path
+        Path to save the JSON file.
     """
-    # Convert all NumPy float types to native Python float
-    stats = {k: float(v) for k, v in stats.items()}
+    try:
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(stats_path, 'w') as f:
+            json.dump(statistics, f, indent=4)
+        logger.info(f"Statistics saved to {stats_path}")
+    except IOError as e:
+        logger.error(f"Error saving statistics to {stats_path}: {e}")
 
-    with open(output_path, 'w') as f:
-        json.dump(stats, f, indent=4)
-    logger.info(f"Statistics saved to {output_path}")
 
 def main():
     """
     Entry point of the process_ndvi.py script.
     """
     parser = argparse.ArgumentParser(
-        description="Process aggregated NDVI data to compute statistical metrics."
+        description="Process aggregated seasonal NDVI data to compute statistical metrics."
     )
     parser.add_argument(
-        "month",
-        type=str,
-        help="Target month for processing in YYYY-MM format."
-    )
-    parser.add_argument(
-        "--sub_area",
+        "year",
         type=int,
-        default=None,
-        help="Specific sub-area number to process. If not provided, statistics will be computed for each sub-area individually."
+        help="Target year as an integer (e.g., 2020)."
     )
     parser.add_argument(
-        "--output",
+        "season",
         type=str,
-        default=None,
-        help="Path to save the statistics JSON file. If not provided, it will be saved in the results directory."
+        choices=["spring", "summer", "autumn", "winter"],
+        help="Season to process (e.g., spring)."
+    )
+    parser.add_argument(
+        "--sub_areas",
+        type=int,
+        nargs='+',
+        help="Sub-area number(s) to process. If not specified, all sub-areas will be processed."
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["mean", "median", "max"],
+        default="mean",
+        help="Aggregation method used during fetching."
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="data",
+        help="Path to the data directory."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results/statistics",
+        help="Path to save the statistics JSON files."
+    )
+    parser.add_argument(
+        "--log_level",
+        type=str,
+        default="DEBUG",
+        help="Logging level (e.g., DEBUG, INFO, WARNING, ERROR)."
     )
 
     args = parser.parse_args()
 
-    # Define project directories
-    SCRIPT_DIR = Path(__file__).resolve().parent  # scripts/
-    PROJECT_ROOT = SCRIPT_DIR.parent  # proyecto_ndvi/
-    DATA_DIR = PROJECT_ROOT / 'data'  # proyecto_ndvi/data/
-    RESULTS_DIR = PROJECT_ROOT / 'results' / 'statistics'
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Configure Logging
+    log_file = Path("logs") / "process_ndvi.log"
+    configure_logging(log_file, log_level=args.log_level)
 
-    if args.sub_area:
-        # Process a specific sub-area
-        ndvi_data = load_ndvi_data(DATA_DIR, args.month, args.sub_area)
-        # Compute statistics
-        stats = compute_statistics(ndvi_data)
-        # Define output path
-        if args.output:
-            output_path = Path(args.output)
-        else:
-            output_filename = f"ndvi_statistics_{args.month}_sub_area_{args.sub_area}.json"
-            output_path = RESULTS_DIR / output_filename
-        # Save statistics
-        save_statistics(stats, output_path)
-    else:
-        # Process all sub-areas individually
-        ndvi_data_list = load_ndvi_data(DATA_DIR, args.month)
-        for idx, ndvi_data in enumerate(ndvi_data_list, start=1):
-            stats = compute_statistics(ndvi_data)
-            if args.output:
-                output_path = Path(args.output).parent / f"ndvi_statistics_{args.month}_sub_area_{idx}.json"
+    # Validate year and season
+    if args.year <= 0:
+        logger.error("Invalid year provided.")
+        sys.exit(1)
+
+    SEASONS = {
+        "spring": [9, 10, 11],   # September, October, November
+        "summer": [12, 1, 2],    # December, January, February
+        "autumn": [3, 4, 5],     # March, April, May
+        "winter": [6, 7, 8],     # June, July, August
+    }
+
+    season = args.season.lower()
+    months = SEASONS.get(season)
+    if not months:
+        logger.error(f"Invalid season: {season}")
+        sys.exit(1)
+
+    # Handle seasons that span two years (e.g., winter)
+    if season == "winter":
+        months_with_years = []
+        for m in months:
+            if m == 12:
+                months_with_years.append((args.year - 1, m))
             else:
-                output_filename = f"ndvi_statistics_{args.month}_sub_area_{idx}.json"
-                output_path = RESULTS_DIR / output_filename
-            save_statistics(stats, output_path)
+                months_with_years.append((args.year, m))
+    else:
+        months_with_years = [(args.year, m) for m in months]
 
-if __name__ == "__main__":
-    main()
+    # Compile month strings in 'YYYY-MM' format
+    season_months = [f"{y}-{m:02d}" for y, m in months_with_years]
+    logger.info(f"Season '{season}' months: {season_months}")
+
+    # Define path to save seasonal statistics (ensure directories exist)
+    for month_str in season_months:
+        month_path = Path(args.data_dir) / "raw" / "ndvi" / month_str
+        month_path.mkdir(parents=True, exist_ok=True)
+
+    # Load sub-area bounds
+    bounds_file = Path(args.data_dir) / 'sub_area_bounds.json'
+    if not bounds_file.exists():
+        logger.error(f"Sub-area bounds file not found: {bounds_file}")
+        sys.exit(1)
+    with open(bounds_file, 'r') as f:
+        sub_area_bounds = json.load(f)
+
+    # Determine sub-areas to process
+    if args.sub_areas:
+        sub_areas = args.sub_areas
+    else:
+        # If not specified, process all sub-areas present in sub_area_bounds
+        sub_areas = [int(k) for k in sub_area_bounds.keys()]
+    logger.info(f"Processing Sub-areas: {sub_areas}")
+
+    # Process each sub-area
+    for sub_area_number in sub_areas:
+        logger.info(f"Processing Sub-area {sub_area_number}")
+
+        # Load NDVI data for all months in the season
+        seasonal_ndvi_list = load_seasonal_ndvi(season_months, sub_area_number, Path(args.data_dir))
+
+        # Select the best images based on valid pixels
+        best_images = select_best_images(seasonal_ndvi_list, top_n=3)  # You can adjust top_n if needed
+
+        if not best_images:
+            logger.error(f"No valid NDVI images found for Sub-area {sub_area_number}. Skipping.")
+            continue
+
+        # Aggregate the best images
+        aggregated_seasonal_ndvi = aggregate_seasonal_ndvi(best_images, method=args.method)
+
+        if aggregated_seasonal_ndvi.size == 0:
+            logger.error(f"Aggregated NDVI data invalid for Sub-area {sub_area_number}. Skipping.")
+            continue
+
+        # Compute statistical metrics
+        statistics = compute_statistics(aggregated_seasonal_ndvi)
+        logger.debug(f"Computed statistics: {statistics}")
+
+        # Define output path for statistics
+        stats_filename = f"ndvi_{season}_{args.year}_sub_area_{sub_area_number}.json"
+        stats_path = Path(args.output_dir) / stats_filename
+        save_statistics(statistics, stats_path)
+
+        # Optionally, save aggregated NDVI as GeoTIFF
+        bounds = sub_area_bounds.get(str(sub_area_number))
+        if bounds:
+            geotiff_filename = f"ndvi_{season}_{args.year}_sub_area_{sub_area_number}.tif"
+            geotiff_path = Path(args.output_dir) / geotiff_filename
+            try:
+                save_ndvi_as_geotiff(aggregated_seasonal_ndvi, geotiff_path, bounds)
+                logger.info(f"Aggregated seasonal NDVI GeoTIFF saved to {geotiff_path}")
+            except Exception as e:
+                logger.error(f"Error saving aggregated seasonal NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
+        else:
+            logger.warning(f"Bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")

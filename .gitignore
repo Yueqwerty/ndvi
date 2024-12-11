@@ -50,6 +50,7 @@ logs/
 # Data
 data/raw/ndvi/
 data/processed/ndvi/
+data/sub_area_bounds.json
 
 # Results
 results/comparisons/
@@ -63,3 +64,8 @@ results/statistics/
 
 # Windows
 Thumbs.db
+
+# Streamlit
+streamlit_app.py
+
+# Proyecto NDVI
