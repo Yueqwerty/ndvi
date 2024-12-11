@@ -1,12 +1,15 @@
 import json
 from pathlib import Path
+import sys
 from typing import Dict, List, Tuple
 from shapely.geometry import Polygon
 import numpy as np
 import rasterio
 from rasterio.transform import from_bounds
 from loguru import logger
-
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.crs import CRS
 
 def load_evalscript(evalscript_path: Path) -> str:
     """
@@ -32,48 +35,48 @@ def load_evalscript(evalscript_path: Path) -> str:
         sys.exit(1)
 
 
-def save_ndvi_as_geotiff(ndvi: np.ndarray, geotiff_path: Path, bounds: List[float], crs: str = "EPSG:4326") -> bool:
+def save_ndvi_as_geotiff(ndvi: np.ndarray, output_path: Path, bounds: List[float], crs_epsg: int = 32719) -> None:
     """
-    Save NDVI array as a GeoTIFF file.
+    Save NDVI data as a GeoTIFF file with proper geospatial metadata.
 
     Parameters
     ----------
     ndvi : np.ndarray
-        NDVI array.
-    geotiff_path : Path
-        Path to save the GeoTIFF.
+        2D array of NDVI values.
+    output_path : Path
+        Path to save the GeoTIFF file.
     bounds : List[float]
-        Bounds of the image in the format [min_lon, min_lat, max_lon, max_lat].
-    crs : str, optional
-        Coordinate Reference System, by default "EPSG:4326".
-
-    Returns
-    -------
-    bool
-        True if saved successfully, False otherwise.
+        Geospatial bounds of the NDVI data in the format [minx, miny, maxx, maxy].
+    crs_epsg : int, optional
+        EPSG code for the coordinate reference system, by default 32719 (UTM zone 19S).
     """
-    try:
-        min_lon, min_lat, max_lon, max_lat = bounds
-        transform = from_bounds(min_lon, min_lat, max_lon, max_lat, ndvi.shape[1], ndvi.shape[0])
-        new_dataset = rasterio.open(
-            geotiff_path,
-            'w',
-            driver='GTiff',
-            height=ndvi.shape[0],
-            width=ndvi.shape[1],
-            count=1,
-            dtype=ndvi.dtype,
-            crs=crs,
-            transform=transform,
-            nodata=np.nan
-        )
-        new_dataset.write(ndvi, 1)
-        new_dataset.close()
-        logger.info(f"GeoTIFF saved successfully at {geotiff_path}")
-        return True
-    except Exception as e:
-        logger.error(f"Error saving processed NDVI to {geotiff_path}: {e}")
-        return False
+    # Define the CRS
+    crs = CRS.from_epsg(crs_epsg)
+
+    # Calculate transform
+    minx, miny, maxx, maxy = bounds
+    height, width = ndvi.shape
+    transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+    # Define the metadata
+    new_dataset = rasterio.open(
+        output_path,
+        'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=1,
+        dtype=ndvi.dtype,
+        crs=crs,
+        transform=transform,
+        nodata=np.nan
+    )
+
+    # Write the NDVI data
+    new_dataset.write(ndvi, 1)
+
+    # Close the dataset
+    new_dataset.close()
 
 
 def divide_aoi_grid(aoi_polygon: Polygon, tile_size: float) -> List[Polygon]:

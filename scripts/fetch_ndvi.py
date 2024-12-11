@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Enhanced Fetch NDVI Script with Cloud Masking and Seasonal Best Image Selection
+Enhanced Fetch NDVI Script with Improved Rate Limit Handling and Directory Organization
 
 This script fetches Landsat-8 NDVI data for specified seasons and sub-areas,
 applies cloud masking using a custom Evalscript, evaluates image quality based on
-validated (cloud-free) pixels, and selects the best images per season for further analysis.
+validated (cloud-free) pixels, selects the best sub-area per season, and saves
+aggregated NDVI data with filenames indicating the year and season.
 
 Usage:
     python scripts/fetch_ndvi.py <YEAR> <SEASON> [--sub_areas SUB_AREA_NUMBERS] [--evalscript EVALSCRIPT_PATH]
@@ -27,7 +28,12 @@ from shapely.geometry import Polygon, box
 from pyproj import Transformer
 from dotenv import load_dotenv
 
-from utils.utils import save_ndvi_as_geotiff, load_evalscript, divide_aoi_grid, calculate_output_dimensions
+from utils.utils import (
+    save_ndvi_as_geotiff,
+    load_evalscript,
+    divide_aoi_grid,
+    calculate_output_dimensions
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -53,8 +59,8 @@ logger.add(sys.stdout, level="INFO")  # Add console logging
 # Sentinel Hub Configuration
 CLIENT_ID = os.getenv("SENTINELHUB_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SENTINELHUB_CLIENT_SECRET")
-TOKEN_URL = os.getenv("SENTINELHUB_TOKEN_URL", "https://services.sentinel-hub.com/oauth/token")
-PROCESS_URL = os.getenv("SENTINELHUB_PROCESS_URL", "https://services.sentinel-hub.com/api/v1/process")
+TOKEN_URL = os.getenv("SENTINELHUB_TOKEN_URL", "https://services-uswest2.sentinel-hub.com/oauth/token")
+PROCESS_URL = os.getenv("SENTINELHUB_PROCESS_URL", "https://services-uswest2.sentinel-hub.com/api/v1/process")
 
 # Verify Credentials
 if not CLIENT_ID or not CLIENT_SECRET:
@@ -69,6 +75,8 @@ transformer_to_wgs84 = Transformer.from_crs("epsg:32719", "epsg:4326", always_xy
 MAX_CONCURRENT_REQUESTS = 2  # Adjust based on API limits
 MAX_CONSECUTIVE_FAILURES = 3  # Limit to skip problematic areas quickly
 BACKOFF_FACTOR = 2  # Exponential backoff factor
+INITIAL_WAIT_TIME = 1  # Initial wait time in seconds
+MAX_RETRIES = 5  # Maximum number of retries for failed requests
 
 # Define the seasons for the Southern Hemisphere
 SEASONS = {
@@ -184,14 +192,14 @@ async def request_ndvi_landsat8(
             else:
                 text = await response.text()
                 logger.error(f"Failed request for NDVI for Sub-area {sub_area_number} on {date}: {response.status} {text}")
-                # Optionally, save error response for debugging
-                error_path = DATA_DIR / "raw" / "ndvi" / date / f"sub_area_{sub_area_number}" / "error_response.txt"
+                # Save error response for debugging
+                error_path = DATA_DIR / "raw" / "errors" / date / f"sub_area_{sub_area_number}" / "error_response.txt"
                 error_path.parent.mkdir(parents=True, exist_ok=True)
                 error_path.write_text(text)
                 return None, consecutive_failures + 1
     except asyncio.TimeoutError:
         logger.error(f"NDVI request timed out for Sub-area {sub_area_number} on {date}.")
-        if attempt < MAX_CONSECUTIVE_FAILURES:
+        if attempt < MAX_RETRIES:
             sleep_time = BACKOFF_FACTOR ** attempt
             logger.info(f"Retrying after {sleep_time} seconds...")
             await asyncio.sleep(sleep_time)
@@ -353,8 +361,7 @@ async def process_sub_area(
     width_pixels = sub_area['width_pixels']
     height_pixels = sub_area['height_pixels']
 
-    ndvi_values = []
-    cloud_masks = []
+    ndvi_list = []
     consecutive_failures = 0  # Initialize failure counter
 
     for date in dates:
@@ -385,20 +392,19 @@ async def process_sub_area(
                         cloud_mask = refine_cloud_mask(cloud_mask)
                         # Mask out cloud pixels
                         ndvi_valid = np.where(cloud_mask == 1, np.nan, ndvi_data)
-                        ndvi_values.append(ndvi_valid)
-                        cloud_masks.append(cloud_mask)
+                        ndvi_list.append(ndvi_valid)
                 logger.debug(f"NDVI and cloud mask data for Sub-area {sub_area_number} on {date} aggregated.")
             except Exception as e:
                 logger.error(f"Error processing NDVI data for Sub-area {sub_area_number} on {date}: {e}")
         else:
             logger.warning(f"No NDVI data obtained for Sub-area {sub_area_number} on {date}.")
 
-    if not ndvi_values:
+    if not ndvi_list:
         logger.error(f"No valid NDVI data found for Sub-area {sub_area_number} in the specified dates.")
         return
 
     # Aggregate NDVI data using masked values (e.g., mean)
-    aggregated_ndvi = np.nanmean(ndvi_values, axis=0)
+    aggregated_ndvi = np.nanmean(ndvi_list, axis=0)
     logger.info(f"Aggregated NDVI data for Sub-area {sub_area_number}.")
 
     # Validate NDVI data
@@ -407,23 +413,23 @@ async def process_sub_area(
         return
 
     # Save aggregated NDVI as `.npy`
-    ndvi_npy_path = raw_ndvi_path / f"sub_area_{sub_area_number}" / "ndvi_monthly.npy"
+    ndvi_npy_path = raw_ndvi_path / f"sub_area_{sub_area_number}" / "ndvi_seasonal.npy"
     try:
         ndvi_npy_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(ndvi_npy_path, aggregated_ndvi)
-        logger.info(f"Aggregated monthly NDVI saved to {ndvi_npy_path}")
+        logger.info(f"Aggregated seasonal NDVI saved to {ndvi_npy_path}")
     except IOError as io_err:
         logger.error(f"Error saving aggregated NDVI for Sub-area {sub_area_number}: {io_err}")
 
     # Optionally: Save aggregated NDVI as GeoTIFF
     sub_area_bounds = sub_area.get('bounds')
     if sub_area_bounds:
-        geotiff_path = raw_ndvi_path / f"sub_area_{sub_area_number}" / "ndvi_monthly.tif"
+        geotiff_path = raw_ndvi_path / f"sub_area_{sub_area_number}" / "ndvi_seasonal.tif"
         try:
             save_ndvi_as_geotiff(aggregated_ndvi, geotiff_path, sub_area_bounds)
-            logger.info(f"Aggregated monthly NDVI GeoTIFF saved to {geotiff_path}")
+            logger.info(f"Aggregated seasonal NDVI GeoTIFF saved to {geotiff_path}")
         except Exception as e:
-            logger.error(f"Error saving aggregated monthly NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
+            logger.error(f"Error saving aggregated seasonal NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
     else:
         logger.warning(f"Bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")
 
@@ -538,6 +544,11 @@ async def main_async(
     for month_str in season_months:
         month_path = data_dir / "raw" / "ndvi" / month_str
         month_path.mkdir(parents=True, exist_ok=True)
+    
+    # Define paths to save error responses
+    for month_str in season_months:
+        error_month_path = data_dir / "raw" / "errors" / month_str
+        error_month_path.mkdir(parents=True, exist_ok=True)
 
     # Create a semaphore to limit concurrent requests
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -574,8 +585,11 @@ async def main_async(
 
     logger.info("NDVI data fetching and aggregation process completed successfully.")
 
-    # Perform seasonal aggregation by selecting the best images
+    # Perform seasonal aggregation by selecting the best sub-area
     logger.info(f"Performing seasonal aggregation for {season.capitalize()} {year}.")
+
+    aggregated_seasonal_ndvi_list = []
+    sub_area_quality = {}
 
     for sub_area_dict in sub_areas_list:
         sub_area_number = sub_area_dict["number"]
@@ -584,7 +598,7 @@ async def main_async(
         # Load NDVI data for all months in the season
         seasonal_ndvi_list = []
         for month_str in season_months:
-            ndvi_file = data_dir / "raw" / "ndvi" / month_str / f"sub_area_{sub_area_number}" / "ndvi_monthly.npy"
+            ndvi_file = data_dir / "raw" / "ndvi" / month_str / f"sub_area_{sub_area_number}" / "ndvi_seasonal.npy"
             if ndvi_file.exists():
                 ndvi = np.load(ndvi_file)
                 seasonal_ndvi_list.append(ndvi)
@@ -592,8 +606,16 @@ async def main_async(
             else:
                 logger.warning(f"NDVI file not found: {ndvi_file}")
 
+        if not seasonal_ndvi_list:
+            logger.warning(f"No NDVI data found for Sub-area {sub_area_number} across the season.")
+            continue
+
         # Select the best images based on valid pixels
         best_images = select_best_images(seasonal_ndvi_list, top_n=top_n)
+
+        if not best_images:
+            logger.warning(f"No valid NDVI images selected for Sub-area {sub_area_number}.")
+            continue
 
         # Aggregate the best images
         aggregated_seasonal_ndvi = aggregate_seasonal_ndvi(best_images, method=method)
@@ -602,19 +624,22 @@ async def main_async(
             logger.error(f"No data aggregated for Sub-area {sub_area_number}. Skipping save.")
             continue
 
-        # Define output path for aggregated seasonal NDVI
-        aggregated_output_path = output_dir / "statistics" / f"ndvi_{season}_{year}_sub_area_{sub_area_number}.npy"
-        aggregated_output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Store quality score for selecting the best sub-area later
+        sub_area_quality[sub_area_number] = evaluate_image_quality(aggregated_seasonal_ndvi)
+
+        # Save aggregated seasonal NDVI as `.npy`
+        aggregated_ndvi_npy_path = output_dir / f"ndvi_{season}_{year}_sub_area_{sub_area_number}.npy"
         try:
-            np.save(aggregated_output_path, aggregated_seasonal_ndvi)
-            logger.info(f"Aggregated seasonal NDVI saved to {aggregated_output_path}")
+            aggregated_ndvi_npy_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(aggregated_ndvi_npy_path, aggregated_seasonal_ndvi)
+            logger.info(f"Aggregated seasonal NDVI saved to {aggregated_ndvi_npy_path}")
         except IOError as io_err:
             logger.error(f"Error saving aggregated seasonal NDVI for Sub-area {sub_area_number}: {io_err}")
 
         # Optionally, save aggregated NDVI as GeoTIFF
         bounds = sub_area_dict['bounds']
         if bounds:
-            geotiff_path = output_dir / "statistics" / f"ndvi_{season}_{year}_sub_area_{sub_area_number}.tif"
+            geotiff_path = output_dir / f"ndvi_{season}_{year}_sub_area_{sub_area_number}.tif"
             try:
                 save_ndvi_as_geotiff(aggregated_seasonal_ndvi, geotiff_path, bounds)
                 logger.info(f"Aggregated seasonal NDVI GeoTIFF saved to {geotiff_path}")
@@ -623,12 +648,41 @@ async def main_async(
         else:
             logger.warning(f"Bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")
 
+    # Select the best sub-area based on quality scores
+    if sub_area_quality:
+        best_sub_area = max(sub_area_quality, key=sub_area_quality.get)
+        logger.info(f"Best Sub-area for {season.capitalize()} {year}: Sub-area {best_sub_area} with {sub_area_quality[best_sub_area]} valid pixels.")
+
+        # Define paths for the best sub-area
+        best_ndvi_npy_path = output_dir / f"ndvi_{season}_{year}_best_sub_area_{best_sub_area}.npy"
+        best_ndvi_tif_path = output_dir / f"ndvi_{season}_{year}_best_sub_area_{best_sub_area}.tif"
+
+        # Copy the aggregated data to the best sub-area files
+        try:
+            original_npy = output_dir / f"ndvi_{season}_{year}_sub_area_{best_sub_area}.npy"
+            original_tif = output_dir / f"ndvi_{season}_{year}_sub_area_{best_sub_area}.tif"
+            if original_npy.exists():
+                np.save(best_ndvi_npy_path, np.load(original_npy))
+                logger.info(f"Best aggregated seasonal NDVI saved to {best_ndvi_npy_path}")
+            else:
+                logger.error(f"Original aggregated NDVI file not found: {original_npy}")
+            if original_tif.exists():
+                geotiff_data = rasterio.open(original_tif).read(1)
+                save_ndvi_as_geotiff(geotiff_data, best_ndvi_tif_path, sub_areas_list[best_sub_area - 1]['bounds'])
+                logger.info(f"Best aggregated seasonal NDVI GeoTIFF saved to {best_ndvi_tif_path}")
+            else:
+                logger.error(f"Original aggregated NDVI GeoTIFF file not found: {original_tif}")
+        except Exception as e:
+            logger.error(f"Error saving best aggregated seasonal NDVI: {e}")
+    else:
+        logger.error("No sub-area quality scores available to determine the best sub-area.")
+
 def main():
     """
     Entry point of the fetch_ndvi.py script.
     """
     parser = argparse.ArgumentParser(
-        description="Fetch and process Landsat-8 NDVI data with cloud masking and seasonal best image selection."
+        description="Fetch and process Landsat-8 NDVI data with cloud masking and seasonal best sub-area selection."
     )
     parser.add_argument(
         "year",
@@ -676,7 +730,7 @@ def main():
         "--output_dir",
         type=str,
         default="results/statistics",
-        help="Path to save the statistics JSON files and aggregated NDVI."
+        help="Path to save the aggregated seasonal NDVI data."
     )
 
     args = parser.parse_args()
