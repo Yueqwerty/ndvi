@@ -1,1 +1,0 @@
-{"error":{"status":400,"reason":"Bad Request","message":"Your request of 19924.58 meters per pixel exceeds the limit 1500.00 meters per pixel of the collection LOTL1. Please revise the resolution (or corresponding width/height) to make sure it is in supported range.","code":"RENDERER_EXCEPTION"}}

@@ -1,207 +1,180 @@
 #!/usr/bin/env python3
 """
-Process Aggregated Monthly NDVI Data to Compute Statistical Metrics
+Process Raw Monthly NDVI Data
 
-This script processes aggregated monthly NDVI data to:
-- Select the best images (with most valid pixels),
-- Aggregate them using a specified method (mean, median, max),
-- Compute statistical metrics (mean, median, std, min, max),
-- Save results as JSON and optionally as GeoTIFF.
+This script processes raw NDVI data for a specific month:
+- Loads NDVI data for all sub-areas,
+- Computes statistical metrics (mean, median, std, min, max),
+- Saves the results as JSON and optionally as GeoTIFF.
 
 Usage:
-    python scripts/process_ndvi.py <YEAR> <MONTH> [--sub_areas SUB_AREA_NUMBERS] [--method <mean|median|max>]
+    python scripts/process_ndvi.py YYYY-MM
 
 Example:
-    python scripts/process_ndvi.py 2020 03 --sub_areas 1 2 3 --method median
+    python scripts/process_ndvi.py 2019-03
 """
 
-import argparse
-import json
 import sys
+import json
 from pathlib import Path
-from typing import Optional, List, Dict
-
 import numpy as np
-from loguru import logger
+import rasterio
+import logging
 
-# Importing utility functions (adjust the path if needed)
-from scripts.utils.utils import (
-    aggregate_monthly_ndvi,
-    select_best_images,
-    save_ndvi_as_geotiff,
-    load_monthly_ndvi_files,
-    configure_logging
+# Configure directories
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DATA_DIR = PROJECT_ROOT / "data"
+LOGS_DIR = PROJECT_ROOT / "logs"
+PROCESSED_DIR = DATA_DIR / "processed" / "ndvi"
+RAW_DIR = DATA_DIR / "raw" / "ndvi"
+BOUNDS_FILE = DATA_DIR / "sub_area_bounds.json"
+
+# Configure logging
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOGS_DIR / "process_ndvi.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
-def compute_statistics(ndvi: np.ndarray) -> Dict[str, float]:
+def load_ndvi_files(month_dir: Path, sub_area: str) -> list:
     """
-    Compute statistical metrics for an NDVI array.
+    Load NDVI files for a specific sub-area.
 
     Parameters
     ----------
-    ndvi : np.ndarray
-        NDVI array.
+    month_dir : Path
+        Path to the directory containing NDVI data for the month.
+    sub_area : str
+        Sub-area folder name (e.g., 'sub_area_1').
 
     Returns
     -------
-    Dict[str, float]
-        Dictionary containing statistical metrics.
+    list
+        List of NDVI arrays as NumPy arrays.
     """
-    statistics = {
-        "mean_ndvi": float(np.nanmean(ndvi)),
-        "median_ndvi": float(np.nanmedian(ndvi)),
-        "max_ndvi": float(np.nanmax(ndvi)),
-        "min_ndvi": float(np.nanmin(ndvi)),
-        "std_dev_ndvi": float(np.nanstd(ndvi))
-    }
-    return statistics
+    sub_area_dir = month_dir / f"sub_area_{sub_area}"  # Cambiar el formato aquí
+    if not sub_area_dir.exists():
+        logging.warning(f"Sub-area directory not found: {sub_area_dir}")
+        return []
 
-def save_statistics(statistics: Dict[str, float], stats_path: Path) -> None:
+    ndvi_files = list(sub_area_dir.glob("*.npy"))
+    ndvi_arrays = []
+
+    for file in ndvi_files:
+        try:
+            ndvi_array = np.load(file)
+            ndvi_arrays.append(ndvi_array)
+            logging.info(f"Loaded NDVI file: {file}")
+        except Exception as e:
+            logging.error(f"Error loading {file}: {e}")
+
+    return ndvi_arrays
+
+def compute_statistics(ndvi_array: np.ndarray) -> dict:
     """
-    Save statistical metrics as a JSON file.
+    Compute basic statistics for an NDVI array.
 
     Parameters
     ----------
-    statistics : Dict[str, float]
-        Statistical metrics.
-    stats_path : Path
-        Path to save the JSON file.
+    ndvi_array : np.ndarray
+        NDVI data as a NumPy array.
+
+    Returns
+    -------
+    dict
+        Dictionary containing statistical metrics.
     """
-    try:
-        stats_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stats_path, 'w') as f:
-            json.dump(statistics, f, indent=4)
-        logger.info(f"Statistics saved to {stats_path}")
-    except IOError as e:
-        logger.error(f"Error saving statistics to {stats_path}: {e}")
+    return {
+        "mean": float(np.nanmean(ndvi_array)),
+        "median": float(np.nanmedian(ndvi_array)),
+        "std_dev": float(np.nanstd(ndvi_array)),
+        "min": float(np.nanmin(ndvi_array)),
+        "max": float(np.nanmax(ndvi_array)),
+    }
+
+def process_month(year_month: str):
+    """
+    Process NDVI data for all sub-areas in a specific month.
+
+    Parameters
+    ----------
+    year_month : str
+        The month to process in 'YYYY-MM' format.
+    """
+    # Ensure data directory exists
+    month_dir = RAW_DIR / year_month
+    if not month_dir.exists():
+        logging.error(f"Month directory not found: {month_dir}")
+        sys.exit(1)
+
+    # Ensure bounds file exists
+    if not BOUNDS_FILE.exists():
+        logging.error(f"Bounds file not found: {BOUNDS_FILE}")
+        sys.exit(1)
+
+    with open(BOUNDS_FILE, "r") as f:
+        sub_area_bounds = json.load(f)
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = PROCESSED_DIR / year_month
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Process each sub-area
+    for sub_area in sub_area_bounds.keys():
+        logging.info(f"Processing Sub-area: {sub_area}")
+
+        # Load NDVI data
+        ndvi_arrays = load_ndvi_files(month_dir, sub_area)
+        if not ndvi_arrays:
+            logging.warning(f"No NDVI data found for Sub-area {sub_area}. Skipping.")
+            continue
+
+        # Aggregate NDVI data (mean)
+        aggregated_ndvi = np.nanmean(ndvi_arrays, axis=0)
+
+        # Compute statistics
+        stats = compute_statistics(aggregated_ndvi)
+        logging.info(f"Computed statistics for Sub-area {sub_area}: {stats}")
+
+        # Save statistics to JSON
+        stats_file = output_dir / f"ndvi_statistics_{sub_area}.json"
+        with open(stats_file, "w") as f:
+            json.dump(stats, f, indent=4)
+        logging.info(f"Statistics saved: {stats_file}")
+
+        # Save aggregated NDVI as GeoTIFF
+        ndvi_tif = output_dir / f"ndvi_{sub_area}.tif"
+        ref_tif_path = month_dir / sub_area / "ndvi_monthly.tif"
+
+        if ref_tif_path.exists():
+            try:
+                with rasterio.open(ref_tif_path) as ref_src:
+                    profile = ref_src.profile.copy()
+                    profile.update(dtype="float32", count=1, nodata=np.nan)
+
+                    with rasterio.open(ndvi_tif, "w", **profile) as dst:
+                        dst.write(aggregated_ndvi, 1)
+                logging.info(f"GeoTIFF saved: {ndvi_tif}")
+            except Exception as e:
+                logging.error(f"Error saving GeoTIFF for Sub-area {sub_area}: {e}")
+        else:
+            logging.warning(f"Reference GeoTIFF not found for Sub-area {sub_area}. Skipping GeoTIFF save.")
 
 def main():
     """
-    Process NDVI data for a given month and sub-areas, compute statistics, and save results.
+    Main entry point for the script.
     """
-    parser = argparse.ArgumentParser(
-        description="Process aggregated monthly NDVI data to compute statistical metrics."
-    )
-    parser.add_argument(
-        "year",
-        type=int,
-        help="Target year as an integer (e.g., 2020)."
-    )
-    parser.add_argument(
-        "month",
-        type=int,
-        choices=range(1,13),
-        help="Target month as an integer (1-12)."
-    )
-    parser.add_argument(
-        "--sub_areas",
-        type=int,
-        nargs='+',
-        help="Sub-area number(s) to process. If not specified, all sub-areas will be processed."
-    )
-    parser.add_argument(
-        "--method",
-        type=str,
-        choices=["mean", "median", "max"],
-        default="mean",
-        help="Aggregation method to use for NDVI."
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="data",
-        help="Path to the data directory."
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="results/statistics",
-        help="Path to save the statistics JSON files."
-    )
-    parser.add_argument(
-        "--log_level",
-        type=str,
-        default="DEBUG",
-        help="Logging level (e.g., DEBUG, INFO, WARNING, ERROR)."
-    )
-
-    args = parser.parse_args()
-
-    # Configure Logging
-    log_file = Path("logs") / "process_ndvi.log"
-    configure_logging(log_file, log_level=args.log_level)
-
-    # Validate year and month
-    if args.year <= 0:
-        logger.error("Invalid year provided.")
-        sys.exit(1)
-    if not 1 <= args.month <= 12:
-        logger.error("Invalid month provided. Must be between 1 and 12.")
+    if len(sys.argv) < 2:
+        logging.error("Usage: python scripts/process_ndvi.py YYYY-MM")
         sys.exit(1)
 
-    month_str = f"{args.year}-{args.month:02d}"
-    logger.info(f"Processing NDVI statistics for {month_str}, Sub-areas: {args.sub_areas if args.sub_areas else 'All'}.")
-
-    data_dir = Path(args.data_dir)
-    output_dir = Path(args.output_dir)
-    bounds_file = data_dir / 'sub_area_bounds.json'
-    if not bounds_file.exists():
-        logger.error(f"Sub-area bounds file not found: {bounds_file}")
-        sys.exit(1)
-
-    with open(bounds_file, 'r') as f:
-        sub_area_bounds = json.load(f)
-
-    # Determine sub-areas to process
-    if args.sub_areas:
-        sub_areas = args.sub_areas
-    else:
-        sub_areas = [int(k) for k in sub_area_bounds.keys()]
-    logger.info(f"Processing Sub-areas: {sub_areas}")
-
-    # Process each sub-area
-    for sub_area_number in sub_areas:
-        logger.info(f"Processing Sub-area {sub_area_number}")
-
-        # Load NDVI data for the month (raw NDVI .npy files)
-        ndvi_list = load_monthly_ndvi_files(args.month, [args.year], sub_area_number, data_dir)
-        if not ndvi_list:
-            logger.warning(f"No NDVI data found for Sub-area {sub_area_number} in {month_str}. Skipping.")
-            continue
-
-        # Select best images based on valid pixels
-        best_images = select_best_images(ndvi_list, top_n=3)
-        if not best_images:
-            logger.warning(f"No valid NDVI images selected for Sub-area {sub_area_number}. Skipping.")
-            continue
-
-        # Aggregate the best images
-        aggregated_monthly_ndvi = aggregate_monthly_ndvi(best_images, method=args.method)
-        if aggregated_monthly_ndvi.size == 0:
-            logger.error(f"Aggregated NDVI data invalid for Sub-area {sub_area_number}. Skipping.")
-            continue
-
-        # Compute statistics
-        statistics = compute_statistics(aggregated_monthly_ndvi)
-        logger.debug(f"Computed statistics for Sub-area {sub_area_number}: {statistics}")
-
-        # Save statistics
-        stats_filename = f"ndvi_{month_str}_sub_area_{sub_area_number}.json"
-        stats_path = output_dir / stats_filename
-        save_statistics(statistics, stats_path)
-
-        # Save aggregated NDVI as GeoTIFF if bounds are available
-        bounds = sub_area_bounds.get(str(sub_area_number))
-        if bounds and 'bounds_proj' in bounds:
-            geotiff_filename = f"ndvi_{month_str}_sub_area_{sub_area_number}.tif"
-            geotiff_path = output_dir / geotiff_filename
-            try:
-                save_ndvi_as_geotiff(aggregated_monthly_ndvi, geotiff_path, bounds['bounds_proj'], crs_epsg=32719)
-                logger.info(f"Aggregated monthly NDVI GeoTIFF saved to {geotiff_path}")
-            except Exception as e:
-                logger.error(f"Error saving aggregated monthly NDVI GeoTIFF for Sub-area {sub_area_number}: {e}")
-        else:
-            logger.warning(f"Projected bounds not found for Sub-area {sub_area_number}. Skipping GeoTIFF save.")
+    year_month = sys.argv[1]
+    process_month(year_month)
 
 if __name__ == "__main__":
     main()
